@@ -1,0 +1,39 @@
+{
+  "title": "VibePod Data Explorer",
+  "description": "Datasette UI for VibePod session logs and HTTP proxy traffic.",
+  "license": "MIT",
+  "databases": {
+    "logs": {
+      "title": "Session Logs",
+      "description": "Interactive sessions and submitted messages captured by VibePod.",
+      "queries": {
+        "recent_sessions": {
+          "title": "Recent sessions",
+          "sql": "SELECT s.id, s.started_at, s.ended_at, s.agent, s.container_name, s.exit_reason, COUNT(m.id) AS message_count FROM sessions s LEFT JOIN messages m ON m.session_id = s.id GROUP BY s.id ORDER BY s.started_at DESC LIMIT CAST(COALESCE(:limit, 100) AS INTEGER)"
+        },
+        "recent_messages": {
+          "title": "Recent messages",
+          "sql": "SELECT m.timestamp, m.session_id, s.agent, s.container_name, m.content FROM messages m JOIN sessions s ON s.id = m.session_id ORDER BY m.timestamp DESC LIMIT CAST(COALESCE(:limit, 200) AS INTEGER)"
+        }
+      }
+    },
+    "proxy": {
+      "title": "HTTP Proxy Logs",
+      "description": "Captured HTTP request/response traffic from vibepod-proxy.",
+      "queries": {
+        "recent_requests": {
+          "title": "Recent proxied requests",
+          "sql": "SELECT r.id AS request_id, r.timestamp, COALESCE(NULLIF(r.source_container_name, ''), NULLIF(r.source_container_id, ''), 'unknown') AS source_container, r.method, r.host, r.path, resp.status_code, resp.duration_ms, err.error_type FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id ORDER BY r.timestamp DESC LIMIT CAST(COALESCE(:limit, 200) AS INTEGER)"
+        },
+        "top_hosts": {
+          "title": "Top request hosts",
+          "sql": "SELECT host, COUNT(*) AS request_count FROM http_requests WHERE host IS NOT NULL AND host != '' GROUP BY host ORDER BY request_count DESC LIMIT CAST(COALESCE(:limit, 50) AS INTEGER)"
+        },
+        "top_sources": {
+          "title": "Top source containers",
+          "sql": "SELECT COALESCE(NULLIF(source_container_name, ''), NULLIF(source_container_id, ''), 'unknown') AS source_container, COUNT(*) AS request_count FROM http_requests GROUP BY COALESCE(NULLIF(source_container_name, ''), NULLIF(source_container_id, ''), 'unknown') ORDER BY request_count DESC LIMIT CAST(COALESCE(:limit, 50) AS INTEGER)"
+        }
+      }
+    }
+  }
+}
