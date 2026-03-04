@@ -1,1 +1,2 @@
 datasette>=0.65,<2.0
+datasette-dashboards>=0.2

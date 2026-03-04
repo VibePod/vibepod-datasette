@@ -2,6 +2,273 @@
   "title": "VibePod Data Explorer",
   "description": "Datasette UI for VibePod session logs and HTTP proxy traffic.",
   "license": "MIT",
+  "plugins": {
+    "datasette-dashboards": {
+      "http-requests": {
+        "title": "HTTP Requests Dashboard",
+        "description": "Traffic, status, host, and error trends from vibepod-proxy.",
+        "settings": {
+          "allow_fullscreen": true,
+          "autorefresh": 1
+        },
+        "layout": [
+          [
+            "total_requests",
+            "total_errors",
+            "error_rate"
+          ],
+          [
+            "avg_duration_ms",
+            "status_breakdown",
+            "host_breakdown"
+          ],
+          [
+            "request_error_trend",
+            "request_error_trend",
+            "top_hosts_table"
+          ],
+          [
+            "recent_requests",
+            "recent_requests",
+            "recent_requests"
+          ]
+        ],
+        "filters": {
+          "time_range": {
+            "name": "Time range",
+            "type": "select",
+            "options": [
+              "1h",
+              "24h",
+              "7d",
+              "30d",
+              "all"
+            ],
+            "default": "24h"
+          },
+          "time_bucket": {
+            "name": "Trend bucket",
+            "type": "select",
+            "options": [
+              "auto",
+              "hour",
+              "day"
+            ],
+            "default": "auto"
+          },
+          "host_query": {
+            "name": "Host contains",
+            "type": "text",
+            "default": ""
+          },
+          "method": {
+            "name": "Method",
+            "type": "select",
+            "db": "proxy",
+            "query": "SELECT method FROM (SELECT 'all' AS method, 0 AS ord UNION ALL SELECT DISTINCT UPPER(method) AS method, 1 AS ord FROM http_requests WHERE method IS NOT NULL AND method != '') ORDER BY ord, method",
+            "default": "all"
+          },
+          "agent": {
+            "name": "Agent",
+            "type": "select",
+            "db": "proxy",
+            "query": "SELECT agent FROM (SELECT 'all' AS agent, 0 AS ord UNION ALL SELECT DISTINCT CASE WHEN COALESCE(source_container_name, '') = '' THEN 'unknown' WHEN source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(source_container_name, 9), '-') > 0 THEN substr(substr(source_container_name, 9), 1, instr(substr(source_container_name, 9), '-') - 1) ELSE substr(source_container_name, 9) END ELSE source_container_name END AS agent, 1 AS ord FROM http_requests) ORDER BY ord, agent",
+            "default": "all"
+          },
+          "status_class": {
+            "name": "Status filter",
+            "type": "select",
+            "options": [
+              "all",
+              "2xx",
+              "3xx",
+              "4xx",
+              "5xx",
+              "error"
+            ],
+            "default": "all"
+          },
+          "host_sort": {
+            "name": "Host ranking",
+            "type": "select",
+            "options": [
+              "request_count",
+              "error_count",
+              "avg_duration_ms"
+            ],
+            "default": "request_count"
+          },
+          "request_sort": {
+            "name": "Request sort",
+            "type": "select",
+            "options": [
+              "timestamp_desc",
+              "timestamp_asc",
+              "errors_first",
+              "duration_desc",
+              "duration_asc",
+              "status_desc",
+              "status_asc"
+            ],
+            "default": "timestamp_desc"
+          },
+          "request_limit": {
+            "name": "Request rows",
+            "type": "number",
+            "default": 100,
+            "min": 20,
+            "max": 500,
+            "step": 10
+          }
+        },
+        "charts": {
+          "total_requests": {
+            "title": "Total requests",
+            "db": "proxy",
+            "query": "SELECT COUNT(*) AS total_requests FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)",
+            "library": "metric",
+            "display": {
+              "field": "total_requests",
+              "suffix": " req"
+            }
+          },
+          "total_errors": {
+            "title": "Total errors",
+            "db": "proxy",
+            "query": "SELECT SUM(CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 1 ELSE 0 END) AS total_errors FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)",
+            "library": "metric",
+            "display": {
+              "field": "total_errors",
+              "suffix": " err"
+            }
+          },
+          "error_rate": {
+            "title": "Error rate",
+            "db": "proxy",
+            "query": "SELECT ROUND((SUM(CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 1 ELSE 0 END) * 100.0) / NULLIF(COUNT(*), 0), 2) AS error_rate_pct FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)",
+            "library": "metric",
+            "display": {
+              "field": "error_rate_pct",
+              "suffix": "%"
+            }
+          },
+          "avg_duration_ms": {
+            "title": "Avg response duration",
+            "db": "proxy",
+            "query": "SELECT ROUND(AVG(resp.duration_ms), 1) AS avg_duration_ms FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)",
+            "library": "metric",
+            "display": {
+              "field": "avg_duration_ms",
+              "suffix": " ms"
+            }
+          },
+          "status_breakdown": {
+            "title": "Status code breakdown",
+            "db": "proxy",
+            "query": "SELECT CASE WHEN resp.status_code IS NULL AND err.error_type IS NOT NULL THEN 'proxy_error' WHEN resp.status_code IS NULL THEN 'no_response' ELSE CAST(resp.status_code AS TEXT) END AS status_code, COUNT(*) AS request_count FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) GROUP BY status_code ORDER BY request_count DESC, status_code ASC LIMIT 20",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "y": {
+                  "field": "status_code",
+                  "type": "nominal",
+                  "sort": "-x",
+                  "title": "Status"
+                },
+                "x": {
+                  "field": "request_count",
+                  "type": "quantitative",
+                  "title": "Requests"
+                },
+                "color": {
+                  "field": "status_code",
+                  "type": "nominal"
+                }
+              }
+            }
+          },
+          "host_breakdown": {
+            "title": "Top hosts by traffic",
+            "db": "proxy",
+            "query": "SELECT COALESCE(NULLIF(r.host, ''), 'unknown') AS host, COUNT(*) AS request_count, SUM(CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 1 ELSE 0 END) AS error_count, ROUND(AVG(resp.duration_ms), 1) AS avg_duration_ms FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) GROUP BY host ORDER BY CASE WHEN COALESCE(:host_sort, 'request_count') = 'request_count' THEN request_count END DESC, CASE WHEN COALESCE(:host_sort, 'request_count') = 'error_count' THEN error_count END DESC, CASE WHEN COALESCE(:host_sort, 'request_count') = 'avg_duration_ms' THEN avg_duration_ms END DESC, request_count DESC, host ASC LIMIT 12",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "y": {
+                  "field": "host",
+                  "type": "nominal",
+                  "sort": "-x",
+                  "title": "Host"
+                },
+                "x": {
+                  "field": "request_count",
+                  "type": "quantitative",
+                  "title": "Requests"
+                },
+                "color": {
+                  "field": "error_count",
+                  "type": "quantitative",
+                  "title": "Errors"
+                }
+              }
+            }
+          },
+          "request_error_trend": {
+            "title": "Request and error trend",
+            "db": "proxy",
+            "query": "WITH filtered AS (SELECT r.timestamp AS ts, CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 1 ELSE 0 END AS is_error FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)), buckets AS (SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') IN ('1h', '24h')) THEN strftime('%Y-%m-%d %H:00', datetime(ts)) ELSE strftime('%Y-%m-%d', datetime(ts)) END AS bucket, COUNT(*) AS request_count, SUM(is_error) AS error_count FROM filtered GROUP BY bucket) SELECT bucket, 'requests' AS series, request_count AS value FROM buckets UNION ALL SELECT bucket, 'errors' AS series, error_count AS value FROM buckets ORDER BY bucket, series",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "line",
+                "point": true,
+                "tooltip": true
+              },
+              "encoding": {
+                "x": {
+                  "field": "bucket",
+                  "type": "nominal",
+                  "sort": "ascending",
+                  "title": "Time"
+                },
+                "y": {
+                  "field": "value",
+                  "type": "quantitative",
+                  "title": "Count"
+                },
+                "color": {
+                  "field": "series",
+                  "type": "nominal"
+                }
+              }
+            }
+          },
+          "top_hosts_table": {
+            "title": "Host statistics",
+            "db": "proxy",
+            "query": "SELECT COALESCE(NULLIF(r.host, ''), 'unknown') AS host, COUNT(*) AS request_count, SUM(CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 1 ELSE 0 END) AS error_count, ROUND(AVG(resp.duration_ms), 1) AS avg_duration_ms FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) GROUP BY host ORDER BY CASE WHEN COALESCE(:host_sort, 'request_count') = 'request_count' THEN request_count END DESC, CASE WHEN COALESCE(:host_sort, 'request_count') = 'error_count' THEN error_count END DESC, CASE WHEN COALESCE(:host_sort, 'request_count') = 'avg_duration_ms' THEN avg_duration_ms END DESC, request_count DESC, host ASC LIMIT 20",
+            "library": "table",
+            "display": {}
+          },
+          "recent_requests": {
+            "title": "Recent requests",
+            "db": "proxy",
+            "query": "SELECT r.id AS request_id, r.timestamp, COALESCE(NULLIF(r.source_container_name, ''), NULLIF(r.source_container_id, ''), 'unknown') AS source_container, COALESCE(r.method, '?') AS method, COALESCE(NULLIF(r.host, ''), 'unknown') AS host, COALESCE(r.path, '') AS path, resp.status_code, resp.duration_ms, err.error_type FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id LEFT JOIN http_errors err ON err.request_id = r.id WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (TRIM(COALESCE(:host_query, '')) = '' OR LOWER(COALESCE(r.host, '')) LIKE '%' || LOWER(TRIM(:host_query)) || '%') AND (COALESCE(:method, 'all') = 'all' OR UPPER(COALESCE(r.method, '')) = UPPER(:method)) AND (COALESCE(:status_class, 'all') = 'all' OR (:status_class = '2xx' AND resp.status_code BETWEEN 200 AND 299) OR (:status_class = '3xx' AND resp.status_code BETWEEN 300 AND 399) OR (:status_class = '4xx' AND resp.status_code BETWEEN 400 AND 499) OR (:status_class = '5xx' AND resp.status_code BETWEEN 500 AND 599) OR (:status_class = 'error' AND (resp.status_code >= 400 OR err.error_type IS NOT NULL))) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) ORDER BY CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'timestamp_asc' THEN datetime(r.timestamp) END ASC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'timestamp_desc' THEN datetime(r.timestamp) END DESC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'duration_asc' THEN resp.duration_ms END ASC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'duration_desc' THEN resp.duration_ms END DESC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'status_asc' THEN resp.status_code END ASC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'status_desc' THEN resp.status_code END DESC, CASE WHEN COALESCE(:request_sort, 'timestamp_desc') = 'errors_first' THEN CASE WHEN resp.status_code >= 400 OR err.error_type IS NOT NULL THEN 0 ELSE 1 END END ASC, datetime(r.timestamp) DESC LIMIT CAST(CASE WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) < 20 THEN 20 WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) > 500 THEN 500 ELSE CAST(COALESCE(:request_limit, 100) AS INTEGER) END AS INTEGER)",
+            "library": "table",
+            "display": {}
+          }
+        }
+      }
+    }
+  },
   "databases": {
     "logs": {
       "title": "Session Logs",
