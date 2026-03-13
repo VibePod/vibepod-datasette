@@ -24,6 +24,7 @@ exec datasette \
   /data/logs.db \
   /data/proxy.db \
   --crossdb \
+  --plugins-dir /app/plugins \
   --metadata /app/metadata.json \
   --host "$DATASETTE_HOST" \
   --port "$DATASETTE_PORT" \
