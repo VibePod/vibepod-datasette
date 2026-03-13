@@ -9,6 +9,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY metadata.json ./metadata.json
+COPY plugins/ ./plugins/
 COPY scripts/start-datasette.sh ./start-datasette.sh
 RUN chmod +x ./start-datasette.sh
 

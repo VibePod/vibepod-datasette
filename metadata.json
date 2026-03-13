@@ -4,6 +4,135 @@
   "license": "MIT",
   "plugins": {
     "datasette-dashboards": {
+      "claude-tokens": {
+        "title": "Claude Code Token Usage",
+        "description": "Token consumption and model usage for Claude Code API calls captured by vibepod-proxy.",
+        "settings": {
+          "allow_fullscreen": true,
+          "autorefresh": 60
+        },
+        "layout": [
+          ["total_calls", "total_input_tokens", "total_output_tokens"],
+          ["total_cache_read_tokens", "total_cache_write_tokens", "avg_tokens_per_call"],
+          ["token_trend", "token_trend", "model_breakdown"],
+          ["recent_calls", "recent_calls", "recent_calls"]
+        ],
+        "filters": {
+          "time_range": {
+            "name": "Time range",
+            "type": "select",
+            "options": ["1h", "24h", "7d", "30d", "all"],
+            "default": "24h"
+          },
+          "time_bucket": {
+            "name": "Trend bucket",
+            "type": "select",
+            "options": ["auto", "hour", "day"],
+            "default": "auto"
+          },
+          "model": {
+            "name": "Model",
+            "type": "select",
+            "db": "proxy",
+            "query": "SELECT model FROM (SELECT 'all' AS model, 0 AS ord UNION ALL SELECT DISTINCT COALESCE(NULLIF(json_extract(CAST(r.body AS TEXT), '$.model'), ''), 'unknown') AS model, 1 AS ord FROM http_requests r WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND json_extract(CAST(r.body AS TEXT), '$.model') IS NOT NULL) ORDER BY ord, model",
+            "default": "all"
+          },
+          "container": {
+            "name": "Container",
+            "type": "select",
+            "db": "proxy",
+            "query": "SELECT container FROM (SELECT 'all' AS container, 0 AS ord UNION ALL SELECT DISTINCT COALESCE(NULLIF(r.source_container_name, ''), 'unknown') AS container, 1 AS ord FROM http_requests r WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST') ORDER BY ord, container",
+            "default": "all"
+          },
+          "request_limit": {
+            "name": "Request rows",
+            "type": "number",
+            "default": 100,
+            "min": 20,
+            "max": 500,
+            "step": 10
+          }
+        },
+        "charts": {
+          "total_calls": {
+            "title": "Total API calls",
+            "db": "proxy",
+            "query": "SELECT COUNT(*) AS total_calls FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)",
+            "library": "metric",
+            "display": {"field": "total_calls", "suffix": " calls"}
+          },
+          "total_input_tokens": {
+            "title": "Total input tokens",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"input_tokens\":') + 14, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.input_tokens') AS INTEGER) ELSE 0 END AS input_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT SUM(input_tokens) AS total_input_tokens FROM base",
+            "library": "metric",
+            "display": {"field": "total_input_tokens", "suffix": " tok"}
+          },
+          "total_output_tokens": {
+            "title": "Total output tokens",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"output_tokens\":') + 15, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.output_tokens') AS INTEGER) ELSE 0 END AS output_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT SUM(output_tokens) AS total_output_tokens FROM base",
+            "library": "metric",
+            "display": {"field": "total_output_tokens", "suffix": " tok"}
+          },
+          "total_cache_read_tokens": {
+            "title": "Cache read tokens",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"cache_read_input_tokens\":') + 25, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.cache_read_input_tokens') AS INTEGER) ELSE 0 END AS cache_read_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT SUM(cache_read_tokens) AS total_cache_read_tokens FROM base",
+            "library": "metric",
+            "display": {"field": "total_cache_read_tokens", "suffix": " tok"}
+          },
+          "total_cache_write_tokens": {
+            "title": "Cache write tokens",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"cache_creation_input_tokens\":') + 29, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.cache_creation_input_tokens') AS INTEGER) ELSE 0 END AS cache_write_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT SUM(cache_write_tokens) AS total_cache_write_tokens FROM base",
+            "library": "metric",
+            "display": {"field": "total_cache_write_tokens", "suffix": " tok"}
+          },
+          "avg_tokens_per_call": {
+            "title": "Avg tokens / call",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT COALESCE(CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"input_tokens\":') + 14, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.input_tokens') AS INTEGER) ELSE 0 END, 0) + COALESCE(CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"output_tokens\":') + 15, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.output_tokens') AS INTEGER) ELSE 0 END, 0) AS total_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT ROUND(AVG(total_tokens), 0) AS avg_tokens_per_call FROM base",
+            "library": "metric",
+            "display": {"field": "avg_tokens_per_call", "suffix": " tok"}
+          },
+          "token_trend": {
+            "title": "Token usage trend",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT r.timestamp AS ts, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"input_tokens\":') + 14, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.input_tokens') AS INTEGER) ELSE 0 END AS input_tokens, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"output_tokens\":') + 15, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.output_tokens') AS INTEGER) ELSE 0 END AS output_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)), buckets AS (SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') IN ('1h', '24h')) THEN strftime('%Y-%m-%d %H:00', datetime(ts)) ELSE strftime('%Y-%m-%d', datetime(ts)) END AS bucket, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM base GROUP BY bucket) SELECT bucket, 'input' AS series, input_tokens AS tokens FROM buckets UNION ALL SELECT bucket, 'output' AS series, output_tokens AS tokens FROM buckets ORDER BY bucket, series",
+            "library": "vega-lite",
+            "display": {
+              "mark": {"type": "line", "point": true, "tooltip": true},
+              "encoding": {
+                "x": {"field": "bucket", "type": "nominal", "sort": "ascending", "title": "Time"},
+                "y": {"field": "tokens", "type": "quantitative", "title": "Tokens"},
+                "color": {"field": "series", "type": "nominal"}
+              }
+            }
+          },
+          "model_breakdown": {
+            "title": "Tokens by model",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT COALESCE(NULLIF(json_extract(CAST(r.body AS TEXT), '$.model'), ''), 'unknown') AS model, COALESCE(CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"input_tokens\":') + 14, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.input_tokens') AS INTEGER) ELSE 0 END, 0) AS input_tokens, COALESCE(CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"output_tokens\":') + 15, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.output_tokens') AS INTEGER) ELSE 0 END, 0) AS output_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT model, COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM base GROUP BY model ORDER BY total_tokens DESC LIMIT 10",
+            "library": "vega-lite",
+            "display": {
+              "mark": {"type": "bar", "tooltip": true},
+              "encoding": {
+                "y": {"field": "model", "type": "nominal", "sort": "-x", "title": "Model"},
+                "x": {"field": "total_tokens", "type": "quantitative", "title": "Total tokens"},
+                "color": {"field": "call_count", "type": "quantitative", "title": "Calls"}
+              }
+            }
+          },
+          "recent_calls": {
+            "title": "Recent API calls",
+            "db": "proxy",
+            "query": "WITH base AS (SELECT r.id AS request_id, r.timestamp, COALESCE(NULLIF(r.source_container_name, ''), 'unknown') AS container, COALESCE(NULLIF(json_extract(CAST(r.body AS TEXT), '$.model'), ''), 'unknown') AS model, resp.status_code, resp.duration_ms, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"input_tokens\":') + 14, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.input_tokens') AS INTEGER) ELSE NULL END AS input_tokens, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"output_tokens\":') + 15, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.output_tokens') AS INTEGER) ELSE NULL END AS output_tokens, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"cache_read_input_tokens\":') + 25, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.cache_read_input_tokens') AS INTEGER) ELSE NULL END AS cache_read_tokens, CASE WHEN resp.body IS NOT NULL AND instr(ungzip(resp.body), '\"type\":\"message_delta\"') > 0 THEN CAST(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"') + instr(substr(ungzip(resp.body), instr(ungzip(resp.body), '\"type\":\"message_delta\"')), '\"cache_creation_input_tokens\":') + 29, 10) AS INTEGER) WHEN resp.body IS NOT NULL AND json_valid(ungzip(resp.body)) THEN CAST(json_extract(ungzip(resp.body), '$.usage.cache_creation_input_tokens') AS INTEGER) ELSE NULL END AS cache_write_tokens FROM http_requests r LEFT JOIN http_responses resp ON resp.request_id = r.id WHERE r.host = 'api.anthropic.com' AND r.path LIKE '/v1/messages%' AND r.method = 'POST' AND (COALESCE(:time_range, '24h') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-24 hours' END)) AND (COALESCE(:model, 'all') = 'all' OR json_extract(CAST(r.body AS TEXT), '$.model') = :model) AND (COALESCE(:container, 'all') = 'all' OR COALESCE(NULLIF(r.source_container_name, ''), 'unknown') = :container)) SELECT request_id, timestamp, container, model, status_code, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms FROM base ORDER BY datetime(timestamp) DESC LIMIT CAST(CASE WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) < 20 THEN 20 WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) > 500 THEN 500 ELSE CAST(COALESCE(:request_limit, 100) AS INTEGER) END AS INTEGER)",
+            "library": "table",
+            "display": {}
+          }
+        }
+      },
       "http-requests": {
         "title": "HTTP Requests Dashboard",
         "description": "Traffic, status, host, and error trends from vibepod-proxy.",
