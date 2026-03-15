@@ -5,7 +5,7 @@ set -eu
 : "${PROXY_DB_PATH:=/proxy/proxy.db}"
 : "${DATASETTE_HOST:=0.0.0.0}"
 : "${DATASETTE_PORT:=8001}"
-: "${SQL_TIME_LIMIT_MS:=10000}"
+: "${SQL_TIME_LIMIT_MS:=60000}"
 : "${DEFAULT_PAGE_SIZE:=50}"
 : "${MAX_RETURNED_ROWS:=2000}"
 : "${TRUNCATE_CELLS_HTML:=80}"
