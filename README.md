@@ -7,6 +7,8 @@ Datasette container for browsing both VibePod SQLite databases:
 - proxy requests include origin container name via `http_requests.source_container_name`
 - built-in HTTP observability dashboard via `datasette-dashboards` at `/-/dashboards/http-requests`
 - dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
+- agent sessions dashboard via `datasette-dashboards` at `/-/dashboards/agent-sessions`
+- agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
 
 ## Environment
 
@@ -86,6 +88,53 @@ Available dashboard filters:
 - request row limit
 
 The dashboard only includes requests attributed to the `codex` agent from `source_container_name`.
+
+## Agent Sessions Dashboard
+
+Open `http://localhost:8001/-/dashboards/agent-sessions` to view session and message usage by agent over time. It is built on the `logs` database (`sessions` and `messages` tables).
+
+It includes:
+
+- total sessions and user messages (summary cards)
+- average sessions per day and messages per session
+- average session duration (from `started_at`/`ended_at`)
+- sessions-by-agent breakdown chart
+- top workspaces by session and message volume
+- sessions-over-time trend (multi-series per agent, daily or hourly buckets)
+- sessions by hour-of-day distribution (work-habits view)
+- recent sessions drill-down table (per-session message counts)
+
+Available dashboard filters:
+
+- time range (`24h`, `7d`, `30d`, `all`; default `7d`)
+- trend bucket (`auto`, `hour`, `day`; `auto` uses hour for `24h` and day otherwise)
+- agent (populated from `sessions.agent`)
+- workspace (populated from `sessions.workspace`)
+- session table row limit (20–500)
+
+Agent identity comes from `sessions.agent`.
+
+## Agent Proxy Requests Dashboard
+
+Open `http://localhost:8001/-/dashboards/agent-proxy-requests` to view proxy HTTP request volume by agent over time. It is built on the `proxy` database (`http_requests` table).
+
+It includes:
+
+- total proxy requests (summary card)
+- requests-by-agent breakdown chart
+- requests-over-time trend (multi-series per agent, daily or hourly buckets)
+- recent proxy requests drill-down table
+
+Available dashboard filters:
+
+- time range (`24h`, `7d`, `30d`, `all`; default `7d`)
+- trend bucket (`auto`, `hour`, `day`; `auto` uses hour for `24h` and day otherwise)
+- agent (populated from `http_requests.source_container_name` via the `vibepod-<agent>-...` parsing used by the other proxy dashboards)
+- request table row limit (20–500)
+
+Agent identity is derived from `http_requests.source_container_name` (e.g. `vibepod-codex-...` -> `codex`), consistent with the HTTP Requests and token dashboards. This dashboard does not support a workspace filter because `http_requests` has no workspace column.
+
+> **Why two dashboards?** Each dashboard chart runs against a single database connection. Although Datasette is started with `--crossdb`, cross-database joins (e.g. `logs.sessions` joined to `proxy.http_requests` in one query) are not available to chart queries in this setup, so the session-side and proxy-side views are split into separate dashboards that each stay within one database.
 
 ## Docs
 

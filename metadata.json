@@ -736,6 +736,384 @@
             "display": {}
           }
         }
+      },
+      "agent-sessions": {
+        "title": "Agent Sessions Dashboard",
+        "description": "Session and message usage by agent over time, from VibePod session logs.",
+        "settings": {
+          "allow_fullscreen": true,
+          "autorefresh": 60
+        },
+        "layout": [
+          [
+            "total_sessions",
+            "total_messages",
+            "avg_sessions_per_day"
+          ],
+          [
+            "avg_messages_per_session",
+            "avg_session_duration_min",
+            "agent_share"
+          ],
+          [
+            "top_workspaces",
+            "sessions_by_day",
+            "sessions_by_day"
+          ],
+          [
+            "time_of_day",
+            "time_of_day",
+            "time_of_day"
+          ],
+          [
+            "recent_sessions",
+            "recent_sessions",
+            "recent_sessions"
+          ]
+        ],
+        "filters": {
+          "time_range": {
+            "name": "Time range",
+            "type": "select",
+            "options": [
+              "24h",
+              "7d",
+              "30d",
+              "all"
+            ],
+            "default": "7d"
+          },
+          "time_bucket": {
+            "name": "Trend bucket",
+            "type": "select",
+            "options": [
+              "auto",
+              "hour",
+              "day"
+            ],
+            "default": "auto"
+          },
+          "agent": {
+            "name": "Agent",
+            "type": "select",
+            "db": "logs",
+            "query": "SELECT agent FROM (SELECT 'all' AS agent, 0 AS ord UNION ALL SELECT DISTINCT agent, 1 AS ord FROM sessions WHERE agent IS NOT NULL AND agent != '') ORDER BY ord, agent",
+            "default": "all"
+          },
+          "workspace": {
+            "name": "Workspace",
+            "type": "select",
+            "db": "logs",
+            "query": "SELECT workspace FROM (SELECT 'all' AS workspace, 0 AS ord UNION ALL SELECT DISTINCT workspace, 1 AS ord FROM sessions WHERE workspace IS NOT NULL AND workspace != '') ORDER BY ord, workspace",
+            "default": "all"
+          },
+          "session_limit": {
+            "name": "Session rows",
+            "type": "number",
+            "default": 100,
+            "min": 20,
+            "max": 500,
+            "step": 10
+          }
+        },
+        "charts": {
+          "total_sessions": {
+            "title": "Total sessions",
+            "db": "logs",
+            "query": "SELECT COUNT(*) AS total_sessions FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace)",
+            "library": "metric",
+            "display": {
+              "field": "total_sessions",
+              "suffix": " sessions"
+            }
+          },
+          "total_messages": {
+            "title": "Total messages",
+            "db": "logs",
+            "query": "SELECT COUNT(*) AS total_messages FROM messages m JOIN sessions s ON s.id = m.session_id WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace)",
+            "library": "metric",
+            "display": {
+              "field": "total_messages",
+              "suffix": " msgs"
+            }
+          },
+          "avg_sessions_per_day": {
+            "title": "Avg sessions / day",
+            "db": "logs",
+            "query": "SELECT ROUND(COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT substr(s.started_at, 1, 10)), 0), 2) AS avg_sessions_per_day FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace)",
+            "library": "metric",
+            "display": {
+              "field": "avg_sessions_per_day",
+              "suffix": " /day"
+            }
+          },
+          "avg_messages_per_session": {
+            "title": "Avg messages / session",
+            "db": "logs",
+            "query": "SELECT ROUND(COUNT(m.id) * 1.0 / NULLIF(COUNT(DISTINCT s.id), 0), 2) AS avg_messages_per_session FROM sessions s LEFT JOIN messages m ON m.session_id = s.id WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace)",
+            "library": "metric",
+            "display": {
+              "field": "avg_messages_per_session",
+              "suffix": " msgs"
+            }
+          },
+          "avg_session_duration_min": {
+            "title": "Avg session duration",
+            "db": "logs",
+            "query": "SELECT ROUND(AVG((unixepoch(ended_at) - unixepoch(started_at)) / 60.0), 1) AS avg_session_duration_min FROM sessions s WHERE s.ended_at IS NOT NULL AND (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace)",
+            "library": "metric",
+            "display": {
+              "field": "avg_session_duration_min",
+              "suffix": " min"
+            }
+          },
+          "agent_share": {
+            "title": "Sessions by agent",
+            "db": "logs",
+            "query": "SELECT s.agent AS agent, COUNT(*) AS session_count FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) GROUP BY s.agent ORDER BY session_count DESC, s.agent ASC LIMIT 20",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "y": {
+                  "field": "agent",
+                  "type": "nominal",
+                  "sort": "-x",
+                  "title": "Agent"
+                },
+                "x": {
+                  "field": "session_count",
+                  "type": "quantitative",
+                  "title": "Sessions"
+                },
+                "color": {
+                  "field": "agent",
+                  "type": "nominal"
+                }
+              }
+            }
+          },
+          "top_workspaces": {
+            "title": "Top workspaces",
+            "db": "logs",
+            "query": "WITH ws_sessions AS ( SELECT s.workspace AS workspace, COUNT(*) AS session_count FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) GROUP BY s.workspace ), ws_messages AS ( SELECT s.workspace AS workspace, COUNT(m.id) AS message_count FROM sessions s LEFT JOIN messages m ON m.session_id = s.id WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) GROUP BY s.workspace ) SELECT wss.workspace, wss.session_count, COALESCE(wm.message_count, 0) AS message_count FROM ws_sessions wss LEFT JOIN ws_messages wm ON wm.workspace = wss.workspace ORDER BY wss.session_count DESC, wss.workspace ASC LIMIT 15",
+            "library": "table",
+            "display": {}
+          },
+          "sessions_by_day": {
+            "title": "Sessions over time",
+            "db": "logs",
+            "query": "WITH filtered AS ( SELECT s.started_at AS ts, s.agent AS agent FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) ) SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '7d') IN ('1h', '24h')) THEN strftime('%Y-%m-%d %H:00', datetime(ts)) ELSE strftime('%Y-%m-%d', datetime(ts)) END AS bucket, agent AS series, COUNT(*) AS value FROM filtered GROUP BY bucket, agent ORDER BY bucket, agent",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "line",
+                "point": true,
+                "tooltip": true
+              },
+              "encoding": {
+                "x": {
+                  "field": "bucket",
+                  "type": "nominal",
+                  "sort": "ascending",
+                  "title": "Time"
+                },
+                "y": {
+                  "field": "value",
+                  "type": "quantitative",
+                  "title": "Sessions"
+                },
+                "color": {
+                  "field": "series",
+                  "type": "nominal",
+                  "title": "Agent"
+                }
+              }
+            }
+          },
+          "time_of_day": {
+            "title": "Sessions by hour of day",
+            "db": "logs",
+            "query": "WITH filtered AS ( SELECT s.started_at AS ts FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) ) SELECT CAST(strftime('%H', datetime(ts)) AS INTEGER) AS hour_of_day, COUNT(*) AS session_count FROM filtered GROUP BY hour_of_day ORDER BY hour_of_day ASC",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "x": {
+                  "field": "hour_of_day",
+                  "type": "quantitative",
+                  "title": "Hour (0-23)",
+                  "scale": {
+                    "domain": [
+                      0,
+                      23
+                    ]
+                  }
+                },
+                "y": {
+                  "field": "session_count",
+                  "type": "quantitative",
+                  "title": "Sessions"
+                }
+              }
+            }
+          },
+          "recent_sessions": {
+            "title": "Recent sessions",
+            "db": "logs",
+            "query": "WITH filtered AS ( SELECT s.id, s.agent, s.workspace, s.container_name, s.started_at, s.ended_at, s.exit_reason FROM sessions s WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(s.started_at) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR s.agent = :agent) AND (COALESCE(:workspace, 'all') = 'all' OR s.workspace = :workspace) ), msg_counts AS ( SELECT m.session_id, COUNT(*) AS message_count FROM messages m JOIN filtered f ON f.id = m.session_id GROUP BY m.session_id ) SELECT f.id AS session_id, f.agent, f.workspace, f.container_name, f.started_at, f.ended_at, f.exit_reason, COALESCE(mc.message_count, 0) AS message_count FROM filtered f LEFT JOIN msg_counts mc ON mc.session_id = f.id ORDER BY datetime(f.started_at) DESC LIMIT CAST(CASE WHEN CAST(COALESCE(:session_limit, 100) AS INTEGER) < 20 THEN 20 WHEN CAST(COALESCE(:session_limit, 100) AS INTEGER) > 500 THEN 500 ELSE CAST(COALESCE(:session_limit, 100) AS INTEGER) END AS INTEGER)",
+            "library": "table",
+            "display": {}
+          }
+        }
+      },
+      "agent-proxy-requests": {
+        "title": "Agent Proxy Requests Dashboard",
+        "description": "Proxy HTTP request volume by agent over time, derived from http_requests.source_container_name.",
+        "settings": {
+          "allow_fullscreen": true,
+          "autorefresh": 60
+        },
+        "layout": [
+          [
+            "total_proxy_requests",
+            "requests_by_agent",
+            "requests_by_agent"
+          ],
+          [
+            "requests_over_time",
+            "requests_over_time",
+            "requests_over_time"
+          ],
+          [
+            "recent_proxy_requests",
+            "recent_proxy_requests",
+            "recent_proxy_requests"
+          ]
+        ],
+        "filters": {
+          "time_range": {
+            "name": "Time range",
+            "type": "select",
+            "options": [
+              "24h",
+              "7d",
+              "30d",
+              "all"
+            ],
+            "default": "7d"
+          },
+          "time_bucket": {
+            "name": "Trend bucket",
+            "type": "select",
+            "options": [
+              "auto",
+              "hour",
+              "day"
+            ],
+            "default": "auto"
+          },
+          "agent": {
+            "name": "Agent",
+            "type": "select",
+            "db": "proxy",
+            "query": "SELECT agent FROM (SELECT 'all' AS agent, 0 AS ord UNION ALL SELECT DISTINCT CASE WHEN COALESCE(source_container_name, '') = '' THEN 'unknown' WHEN source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(source_container_name, 9), '-') > 0 THEN substr(substr(source_container_name, 9), 1, instr(substr(source_container_name, 9), '-') - 1) ELSE substr(source_container_name, 9) END ELSE source_container_name END AS agent, 1 AS ord FROM http_requests WHERE source_container_name IS NOT NULL AND source_container_name != '') ORDER BY ord, agent",
+            "default": "all"
+          },
+          "request_limit": {
+            "name": "Request rows",
+            "type": "number",
+            "default": 100,
+            "min": 20,
+            "max": 500,
+            "step": 10
+          }
+        },
+        "charts": {
+          "total_proxy_requests": {
+            "title": "Total proxy requests",
+            "db": "proxy",
+            "query": "SELECT COUNT(*) AS total_proxy_requests FROM http_requests r WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent)",
+            "library": "metric",
+            "display": {
+              "field": "total_proxy_requests",
+              "suffix": " reqs"
+            }
+          },
+          "requests_by_agent": {
+            "title": "Requests by agent",
+            "db": "proxy",
+            "query": "SELECT CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END AS agent, COUNT(*) AS request_count FROM http_requests r WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) GROUP BY CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END ORDER BY request_count DESC, agent ASC LIMIT 20",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "y": {
+                  "field": "agent",
+                  "type": "nominal",
+                  "sort": "-x",
+                  "title": "Agent"
+                },
+                "x": {
+                  "field": "request_count",
+                  "type": "quantitative",
+                  "title": "Requests"
+                },
+                "color": {
+                  "field": "agent",
+                  "type": "nominal"
+                }
+              }
+            }
+          },
+          "requests_over_time": {
+            "title": "Requests over time",
+            "db": "proxy",
+            "query": "SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '7d') IN ('1h', '24h')) THEN strftime('%Y-%m-%d %H:00', datetime(r.timestamp)) ELSE strftime('%Y-%m-%d', datetime(r.timestamp)) END AS bucket, CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END AS series, COUNT(*) AS value FROM http_requests r WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) GROUP BY bucket, series ORDER BY bucket, series",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "line",
+                "point": true,
+                "tooltip": true
+              },
+              "encoding": {
+                "x": {
+                  "field": "bucket",
+                  "type": "nominal",
+                  "sort": "ascending",
+                  "title": "Time"
+                },
+                "y": {
+                  "field": "value",
+                  "type": "quantitative",
+                  "title": "Requests"
+                },
+                "color": {
+                  "field": "series",
+                  "type": "nominal",
+                  "title": "Agent"
+                }
+              }
+            }
+          },
+          "recent_proxy_requests": {
+            "title": "Recent proxy requests",
+            "db": "proxy",
+            "query": "SELECT r.id AS request_id, r.timestamp, CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END AS agent, COALESCE(r.method, '?') AS method, COALESCE(NULLIF(r.host, ''), 'unknown') AS host, r.path FROM http_requests r WHERE (COALESCE(:time_range, '7d') = 'all' OR datetime(r.timestamp) >= datetime('now', CASE COALESCE(:time_range, '7d') WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' ELSE '-7 days' END)) AND (COALESCE(:agent, 'all') = 'all' OR CASE WHEN COALESCE(r.source_container_name, '') = '' THEN 'unknown' WHEN r.source_container_name LIKE 'vibepod-%' THEN CASE WHEN instr(substr(r.source_container_name, 9), '-') > 0 THEN substr(substr(r.source_container_name, 9), 1, instr(substr(r.source_container_name, 9), '-') - 1) ELSE substr(r.source_container_name, 9) END ELSE r.source_container_name END = :agent) ORDER BY datetime(r.timestamp) DESC LIMIT CAST(CASE WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) < 20 THEN 20 WHEN CAST(COALESCE(:request_limit, 100) AS INTEGER) > 500 THEN 500 ELSE CAST(COALESCE(:request_limit, 100) AS INTEGER) END AS INTEGER)",
+            "library": "table",
+            "display": {}
+          }
+        }
       }
     }
   },
