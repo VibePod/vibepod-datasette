@@ -1,0 +1,24 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local database artifacts (usage cache built by scripts/build_usage_cache.py,
+# plus any logs.db/proxy.db copied in for testing)
+*.db
+*.db-wal
+*.db-shm
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
