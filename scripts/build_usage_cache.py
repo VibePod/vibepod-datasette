@@ -20,7 +20,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -121,6 +121,7 @@ ORDER BY ws.id
 LIMIT ?
 """
 
+
 def agent_from_container(container: str | None) -> str:
     name = (container or "").strip()
     if not name:
@@ -162,7 +163,7 @@ def open_cache(path: Path) -> sqlite3.Connection:
         conn.executescript(
             "DROP VIEW IF EXISTS agent_token_usage;"
             "DROP TABLE IF EXISTS token_usage;"
-            "DROP TABLE IF EXISTS sync_state;"
+            "DROP TABLE IF EXISTS sync_state;",
         )
     conn.executescript(SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -171,14 +172,16 @@ def open_cache(path: Path) -> sqlite3.Connection:
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
     ).fetchone()
     return row is not None
 
 
 def watermark(cache: sqlite3.Connection, source: str) -> int:
     row = cache.execute(
-        "SELECT last_row_id FROM sync_state WHERE source = ?", (source,)
+        "SELECT last_row_id FROM sync_state WHERE source = ?",
+        (source,),
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -188,7 +191,7 @@ def set_watermark(cache: sqlite3.Connection, source: str, row_id: int) -> None:
         "INSERT INTO sync_state (source, last_row_id, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(source) DO UPDATE SET last_row_id = excluded.last_row_id, "
         "updated_at = excluded.updated_at",
-        (source, row_id, datetime.now(timezone.utc).isoformat()),
+        (source, row_id, datetime.now(UTC).isoformat()),
     )
 
 
@@ -266,7 +269,14 @@ def build(proxy_path: Path, usage_path: Path, batch_size=500, max_rows=0, full=F
     counts = {"http": 0, "ws": 0}
     try:
         if table_exists(src, "http_responses") and table_exists(src, "http_requests"):
-            counts["http"] = sync_source("http", HTTP_SQL, src, cache, batch_size, max_rows)
+            counts["http"] = sync_source(
+                "http",
+                HTTP_SQL,
+                src,
+                cache,
+                batch_size,
+                max_rows,
+            )
         if table_exists(src, "websocket_messages"):
             counts["ws"] = sync_source("ws", WS_SQL, src, cache, batch_size, max_rows)
     finally:
@@ -277,12 +287,31 @@ def build(proxy_path: Path, usage_path: Path, batch_size=500, max_rows=0, full=F
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--proxy-db", default=os.environ.get("PROXY_DB_PATH", "/data/proxy.db"))
-    parser.add_argument("--usage-db", default=os.environ.get("USAGE_DB_PATH", "/data/usage.db"))
+    parser.add_argument(
+        "--proxy-db",
+        default=os.environ.get("PROXY_DB_PATH", "/data/proxy.db"),
+    )
+    parser.add_argument(
+        "--usage-db",
+        default=os.environ.get("USAGE_DB_PATH", "/data/usage.db"),
+    )
     parser.add_argument("--batch-size", type=int, default=500)
-    parser.add_argument("--max-rows", type=int, default=0, help="0 processes everything")
-    parser.add_argument("--full", action="store_true", help="rebuild the cache from scratch")
-    parser.add_argument("--loop", action="store_true", help="keep refreshing on an interval")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="0 processes everything",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="rebuild the cache from scratch",
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="keep refreshing on an interval",
+    )
     parser.add_argument(
         "--interval",
         type=int,

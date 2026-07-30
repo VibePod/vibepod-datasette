@@ -346,7 +346,7 @@ def _extract_usage(data, host=None):
             "cache_write": totals["cache_write"],
             "reasoning": totals["reasoning"],
             "found": 1 if found else 0,
-        }
+        },
     )
     if key is not None:
         _usage_cache[key] = result

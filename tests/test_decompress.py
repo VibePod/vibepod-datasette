@@ -1,13 +1,12 @@
 import gzip
 import importlib
 import json
-import re
 import sqlite3
 import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -66,8 +65,8 @@ class UsageExtractionTests(unittest.TestCase):
                     'data: {"type":"message_delta","usage":{"output_tokens":50}}',
                     "event: message_delta",
                     'data: {"type":"message_delta","usage":{"output_tokens":300}}',
-                ]
-            ).encode()
+                ],
+            ).encode(),
         )
 
         usage = _usage(body, "api.anthropic.com")
@@ -88,8 +87,8 @@ class UsageExtractionTests(unittest.TestCase):
                     "completion_tokens": 20,
                     "prompt_tokens_details": {"cached_tokens": 10},
                     "completion_tokens_details": {"reasoning_tokens": 4},
-                }
-            }
+                },
+            },
         ).encode()
 
         usage = _usage(body, "api.groq.com")
@@ -104,7 +103,7 @@ class UsageExtractionTests(unittest.TestCase):
                 'data: {"usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":10}}',
                 'data: {"usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":120,'
                 '"thoughtsTokenCount":40,"cachedContentTokenCount":200}}',
-            ]
+            ],
         ).encode()
 
         usage = _usage(body, "cloudcode-pa.googleapis.com")
@@ -123,9 +122,9 @@ class UsageExtractionTests(unittest.TestCase):
                         "output_tokens": 90,
                         "input_tokens_details": {"cached_tokens": 600},
                         "output_tokens_details": {"reasoning_tokens": 30},
-                    }
+                    },
                 },
-            }
+            },
         ).encode()
 
         usage = _usage(body, "chatgpt.com")
@@ -135,14 +134,20 @@ class UsageExtractionTests(unittest.TestCase):
         self.assertEqual((usage["cached"], usage["reasoning"]), (600, 30))
 
     def test_body_without_usage_is_reported_as_not_found(self):
-        usage = _usage(b'data: {"choices":[{"delta":{"content":"hi"}}]}', "api.githubcopilot.com")
+        usage = _usage(
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}',
+            "api.githubcopilot.com",
+        )
 
         self.assertEqual(usage["found"], 0)
         self.assertEqual(usage["input"], 0)
         self.assertEqual(usage["provider"], "github-copilot")
 
     def test_unknown_host_keeps_host_as_provider_label(self):
-        self.assertEqual(_usage(b"{}", "llm.internal.example")["provider"], "llm.internal.example")
+        self.assertEqual(
+            _usage(b"{}", "llm.internal.example")["provider"],
+            "llm.internal.example",
+        )
         self.assertEqual(_usage(b"{}", None)["provider"], "unknown")
 
     def test_null_body_is_handled(self):
@@ -158,11 +163,16 @@ class UsageExtractionTests(unittest.TestCase):
         self.assertEqual(second["provider"], "mistral")
 
     def test_plain_non_json_bodies_survive_the_brotli_probe(self):
-        self.assertEqual(decompress._ungzip(b"<html>not an api call</html>"), "<html>not an api call</html>")
+        self.assertEqual(
+            decompress._ungzip(b"<html>not an api call</html>"),
+            "<html>not an api call</html>",
+        )
 
     @unittest.skipIf(decompress.brotli is None, "brotli not installed")
     def test_brotli_bodies_decode(self):
-        payload = json.dumps({"usage": {"input_tokens": 11, "output_tokens": 3}}).encode()
+        payload = json.dumps(
+            {"usage": {"input_tokens": 11, "output_tokens": 3}},
+        ).encode()
         compressed = decompress.brotli.compress(payload)
 
         usage = _usage(compressed, "api.anthropic.com")
@@ -219,7 +229,15 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         return counts
 
-    def _request(self, rid, host, path, container, model, ts="2026-07-26T10:00:00+00:00"):
+    def _request(
+        self,
+        rid,
+        host,
+        path,
+        container,
+        model,
+        ts="2026-07-26T10:00:00+00:00",
+    ):
         self.source.execute(
             "INSERT INTO http_requests (id, timestamp, method, source_container_name, host, "
             "path, body) VALUES (?, ?, 'POST', ?, ?, ?, ?)",
@@ -234,26 +252,55 @@ class AgentTokenSqlTests(unittest.TestCase):
         )
 
     def _seed(self):
-        self._request("r1", "api.anthropic.com", "/v1/messages", "vibepod-claude-abc1", "opus")
+        self._request(
+            "r1",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "opus",
+        )
         self._response(
             "r1",
             gzip.compress(
                 b'data: {"type":"message_start","message":{"usage":'
                 b'{"input_tokens":1200,"cache_read_input_tokens":900,'
                 b'"cache_creation_input_tokens":100}}}\n'
-                b'data: {"type":"message_delta","usage":{"output_tokens":300}}'
+                b'data: {"type":"message_delta","usage":{"output_tokens":300}}',
             ),
         )
 
-        self._request("r2", "api.groq.com", "/openai/v1/chat/completions", "vibepod-tau-abc2", "l3")
-        self._response("r2", json.dumps({"usage": {"prompt_tokens": 80, "completion_tokens": 20}}).encode())
+        self._request(
+            "r2",
+            "api.groq.com",
+            "/openai/v1/chat/completions",
+            "vibepod-tau-abc2",
+            "l3",
+        )
+        self._response(
+            "r2",
+            json.dumps(
+                {"usage": {"prompt_tokens": 80, "completion_tokens": 20}},
+            ).encode(),
+        )
 
         # Copilot call without usage: must not silently count as zero tokens.
-        self._request("r3", "api.githubcopilot.com", "/chat/completions", "vibepod-copilot-abc3", "x")
+        self._request(
+            "r3",
+            "api.githubcopilot.com",
+            "/chat/completions",
+            "vibepod-copilot-abc3",
+            "x",
+        )
         self._response("r3", b'data: {"choices":[{"delta":{"content":"hi"}}]}')
 
         # Codex: usage arrives on the websocket, the HTTP row must be skipped.
-        self._request("r4", "chatgpt.com", "/backend-api/codex/responses", "vibepod-codex-abc4", "c")
+        self._request(
+            "r4",
+            "chatgpt.com",
+            "/backend-api/codex/responses",
+            "vibepod-codex-abc4",
+            "c",
+        )
         self._response("r4", b'{"ok":true}')
         self.source.execute(
             "INSERT INTO websocket_messages (request_id, timestamp, direction, type, content) "
@@ -264,8 +311,10 @@ class AgentTokenSqlTests(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "response.completed",
-                        "response": {"usage": {"input_tokens": 700, "output_tokens": 90}},
-                    }
+                        "response": {
+                            "usage": {"input_tokens": 700, "output_tokens": 90},
+                        },
+                    },
                 ).encode(),
             ),
         )
@@ -302,7 +351,10 @@ class AgentTokenSqlTests(unittest.TestCase):
             with self.subTest(chart=name):
                 self.conn.execute(chart["query"], self.PARAMS).fetchall()
 
-        total = self.conn.execute(charts["total_tokens"]["query"], self.PARAMS).fetchone()[0]
+        total = self.conn.execute(
+            charts["total_tokens"]["query"],
+            self.PARAMS,
+        ).fetchone()[0]
         self.assertEqual(total, 1500 + 100 + 790)
 
     def test_agent_filter_narrows_totals(self):
@@ -337,10 +389,12 @@ class AgentTokenSqlTests(unittest.TestCase):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
 
         written = self.conn.execute(
-            charts["total_cache_write_tokens"]["query"], self.PARAMS
+            charts["total_cache_write_tokens"]["query"],
+            self.PARAMS,
         ).fetchone()[0]
         cached = self.conn.execute(
-            charts["total_cached_tokens"]["query"], self.PARAMS
+            charts["total_cached_tokens"]["query"],
+            self.PARAMS,
         ).fetchone()[0]
 
         self.assertEqual(written, 100)
@@ -357,17 +411,30 @@ class AgentTokenSqlTests(unittest.TestCase):
     def _trend_buckets(self, **params):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
         rows = self.conn.execute(
-            charts["token_trend"]["query"], dict(self.PARAMS, **params)
+            charts["token_trend"]["query"],
+            dict(self.PARAMS, **params),
         ).fetchall()
         return sorted({row[0] for row in rows})
 
     def test_five_minute_buckets_floor_to_the_slot(self):
         # 10:00:00 and 10:03:30 share a slot; 10:07:00 starts the next one.
-        self._request("t1", "api.groq.com", "/v1/chat", "vibepod-tau-t1", "l3",
-                      ts="2026-07-26T10:03:30+00:00")
+        self._request(
+            "t1",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-t1",
+            "l3",
+            ts="2026-07-26T10:03:30+00:00",
+        )
         self._response("t1", json.dumps({"usage": {"prompt_tokens": 5}}).encode())
-        self._request("t2", "api.groq.com", "/v1/chat", "vibepod-tau-t2", "l3",
-                      ts="2026-07-26T10:07:00+00:00")
+        self._request(
+            "t2",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-t2",
+            "l3",
+            ts="2026-07-26T10:07:00+00:00",
+        )
         self._response("t2", json.dumps({"usage": {"prompt_tokens": 5}}).encode())
         self.source.commit()
         self.refresh()
@@ -380,11 +447,20 @@ class AgentTokenSqlTests(unittest.TestCase):
 
     def test_auto_bucket_uses_five_minutes_for_one_hour_range(self):
         # Seed a call inside the last hour so the 1h window actually has data.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=10)
-        self._request("a1", "api.groq.com", "/v1/chat", "vibepod-tau-a1", "l3",
-                      ts=recent.isoformat())
-        self._response("a1", json.dumps({"usage": {"prompt_tokens": 5}}).encode(),
-                       ts=recent.isoformat())
+        recent = datetime.now(UTC) - timedelta(minutes=10)
+        self._request(
+            "a1",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-a1",
+            "l3",
+            ts=recent.isoformat(),
+        )
+        self._response(
+            "a1",
+            json.dumps({"usage": {"prompt_tokens": 5}}).encode(),
+            ts=recent.isoformat(),
+        )
         self.source.commit()
         self.refresh()
 
@@ -397,12 +473,18 @@ class AgentTokenSqlTests(unittest.TestCase):
     def test_bucket_filter_offers_five_minute_option(self):
         filters = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["filters"]
 
-        self.assertEqual(filters["time_bucket"]["options"], ["auto", "5min", "hour", "day"])
+        self.assertEqual(
+            filters["time_bucket"]["options"],
+            ["auto", "5min", "hour", "day"],
+        )
 
     def test_bar_charts_split_input_and_output_series(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
 
-        rows = self.conn.execute(charts["tokens_by_agent"]["query"], self.PARAMS).fetchall()
+        rows = self.conn.execute(
+            charts["tokens_by_agent"]["query"],
+            self.PARAMS,
+        ).fetchall()
 
         by_key = {(row[0], row[1]): row[2] for row in rows}
         self.assertEqual(by_key[("claude", "input")], 1200)
@@ -415,7 +497,10 @@ class AgentTokenSqlTests(unittest.TestCase):
     def test_provider_bar_chart_groups_by_provider(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
 
-        rows = self.conn.execute(charts["tokens_by_provider"]["query"], self.PARAMS).fetchall()
+        rows = self.conn.execute(
+            charts["tokens_by_provider"]["query"],
+            self.PARAMS,
+        ).fetchall()
 
         by_key = {(row[0], row[1]): row[2] for row in rows}
         self.assertEqual(by_key[("anthropic", "input")], 1200)
@@ -426,7 +511,10 @@ class AgentTokenSqlTests(unittest.TestCase):
         params = dict(self.PARAMS, provider="anthropic")
 
         total = self.conn.execute(charts["total_tokens"]["query"], params).fetchone()[0]
-        agents = self.conn.execute(charts["tokens_by_agent"]["query"], params).fetchall()
+        agents = self.conn.execute(
+            charts["tokens_by_agent"]["query"],
+            params,
+        ).fetchall()
 
         self.assertEqual(total, 1500)
         self.assertEqual({row[0] for row in agents}, {"claude"})
@@ -450,7 +538,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                     "model": "gpt-5-codex",
                     "usage": {"input_tokens": 500, "output_tokens": 50},
                 },
-            }
+            },
         ).encode()
         for ts in ("2026-07-26T11:00:00+00:00", "2026-07-26T11:00:01+00:00"):
             self.source.execute(
@@ -462,17 +550,21 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.refresh()
 
         stored = self.conn.execute(
-            "SELECT COUNT(*) FROM token_usage WHERE response_id = 'resp_dup'"
+            "SELECT COUNT(*) FROM token_usage WHERE response_id = 'resp_dup'",
         ).fetchone()[0]
         counted = self.conn.execute(
-            "SELECT COUNT(*), SUM(input_tokens) FROM agent_token_usage WHERE response_id = 'resp_dup'"
+            "SELECT COUNT(*), SUM(input_tokens) FROM agent_token_usage "
+            "WHERE response_id = 'resp_dup'",
         ).fetchone()
 
         self.assertEqual(stored, 2)
         self.assertEqual(counted, (1, 500))
 
     def test_duplicate_dedup_keeps_the_fullest_snapshot(self):
-        for tokens, ts in ((10, "2026-07-26T12:00:00+00:00"), (900, "2026-07-26T12:00:02+00:00")):
+        for tokens, ts in (
+            (10, "2026-07-26T12:00:00+00:00"),
+            (900, "2026-07-26T12:00:02+00:00"),
+        ):
             self.source.execute(
                 "INSERT INTO websocket_messages (request_id, timestamp, direction, type, content) "
                 "VALUES ('r4', ?, 'incoming', 'text', ?)",
@@ -485,7 +577,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                                 "id": "resp_partial",
                                 "usage": {"input_tokens": tokens, "output_tokens": 1},
                             },
-                        }
+                        },
                     ).encode(),
                 ),
             )
@@ -493,7 +585,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.refresh()
 
         kept = self.conn.execute(
-            "SELECT input_tokens FROM agent_token_usage WHERE response_id = 'resp_partial'"
+            "SELECT input_tokens FROM agent_token_usage WHERE response_id = 'resp_partial'",
         ).fetchall()
 
         self.assertEqual(kept, [(900,)])
@@ -513,7 +605,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                                 "id": f"resp_turn_{idx}",
                                 "usage": {"input_tokens": 100, "output_tokens": 10},
                             },
-                        }
+                        },
                     ).encode(),
                 ),
             )
@@ -522,7 +614,7 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         turns = self.conn.execute(
             "SELECT COUNT(*), SUM(input_tokens) FROM agent_token_usage "
-            "WHERE response_id LIKE 'resp_turn_%'"
+            "WHERE response_id LIKE 'resp_turn_%'",
         ).fetchone()
 
         self.assertEqual(turns, (3, 300))
@@ -547,7 +639,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                             "model": "gpt-5-codex-high",
                             "usage": {"input_tokens": 5, "output_tokens": 1},
                         },
-                    }
+                    },
                 ).encode(),
             ),
         )
@@ -555,7 +647,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.refresh()
 
         model = self.conn.execute(
-            "SELECT model FROM agent_token_usage WHERE response_id = 'resp_model'"
+            "SELECT model FROM agent_token_usage WHERE response_id = 'resp_model'",
         ).fetchone()[0]
 
         self.assertEqual(model, "gpt-5-codex-high")
@@ -563,8 +655,13 @@ class AgentTokenSqlTests(unittest.TestCase):
     def test_schema_upgrade_rebuilds_an_older_cache(self):
         legacy = Path(self.tmp.name) / "legacy-usage.db"
         conn = sqlite3.connect(legacy)
-        conn.execute("CREATE TABLE token_usage (source TEXT, row_id INTEGER, request_id TEXT)")
-        conn.execute("CREATE TABLE sync_state (source TEXT PRIMARY KEY, last_row_id INTEGER, updated_at TEXT)")
+        conn.execute(
+            "CREATE TABLE token_usage (source TEXT, row_id INTEGER, request_id TEXT)",
+        )
+        conn.execute(
+            "CREATE TABLE sync_state "
+            "(source TEXT PRIMARY KEY, last_row_id INTEGER, updated_at TEXT)",
+        )
         conn.execute("INSERT INTO sync_state VALUES ('http', 999, '2026-01-01')")
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
@@ -586,14 +683,19 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(again, {"http": 0, "ws": 0})
 
         self._request("r5", "api.groq.com", "/v1/chat", "vibepod-tau-abc5", "l3")
-        self._response("r5", json.dumps({"usage": {"prompt_tokens": 7, "completion_tokens": 3}}).encode())
+        self._response(
+            "r5",
+            json.dumps(
+                {"usage": {"prompt_tokens": 7, "completion_tokens": 3}},
+            ).encode(),
+        )
         self.source.commit()
 
         counts = self.refresh()
 
         self.assertEqual(counts["http"], 1)
         rows = self.conn.execute(
-            "SELECT SUM(input_tokens + output_tokens) FROM agent_token_usage WHERE agent = 'tau'"
+            "SELECT SUM(input_tokens + output_tokens) FROM agent_token_usage WHERE agent = 'tau'",
         ).fetchone()
         self.assertEqual(rows[0], 110)
 
@@ -608,10 +710,10 @@ class AgentTokenSqlTests(unittest.TestCase):
 
     def test_dedup_view_drops_http_twin_of_websocket_call(self):
         raw = self.conn.execute(
-            "SELECT COUNT(*) FROM token_usage WHERE request_id = 'r4'"
+            "SELECT COUNT(*) FROM token_usage WHERE request_id = 'r4'",
         ).fetchone()[0]
         deduped = self.conn.execute(
-            "SELECT source FROM agent_token_usage WHERE request_id = 'r4'"
+            "SELECT source FROM agent_token_usage WHERE request_id = 'r4'",
         ).fetchall()
 
         self.assertEqual(raw, 2)
@@ -626,7 +728,10 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(counts, {"http": 0, "ws": 0})
         conn = sqlite3.connect(target)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0], 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0],
+            0,
+        )
 
     def test_cache_state_query_reports_watermarks(self):
         sql = self.metadata["databases"]["usage"]["queries"]["usage_cache_state"]["sql"]
@@ -638,9 +743,15 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(state["http"][3], 4)
 
     def test_agent_name_parsing(self):
-        self.assertEqual(build_usage_cache.agent_from_container("vibepod-claude-a1b2"), "claude")
+        self.assertEqual(
+            build_usage_cache.agent_from_container("vibepod-claude-a1b2"),
+            "claude",
+        )
         self.assertEqual(build_usage_cache.agent_from_container("vibepod-tau"), "tau")
-        self.assertEqual(build_usage_cache.agent_from_container("other-container"), "other-container")
+        self.assertEqual(
+            build_usage_cache.agent_from_container("other-container"),
+            "other-container",
+        )
         self.assertEqual(build_usage_cache.agent_from_container(""), "unknown")
         self.assertEqual(build_usage_cache.agent_from_container(None), "unknown")
 
