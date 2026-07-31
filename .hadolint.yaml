@@ -1,0 +1,2 @@
+# Fail only on warnings and errors; info-level rules are advisory.
+failure-threshold: warning
