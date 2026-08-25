@@ -411,22 +411,30 @@ class AgentTokenSqlTests(unittest.TestCase):
     def _heatmap_rows(self, chart_name, **params):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
         return self.conn.execute(
-            charts[chart_name]["query"], dict(self.PARAMS, **params)
+            charts[chart_name]["query"],
+            dict(self.PARAMS, **params),
         ).fetchall()
 
-    def _seed_usage_call(self, rid, ts, prompt_tokens, completion_tokens, container="vibepod-tau-hm"):
+    def _seed_usage_call(
+        self,
+        rid,
+        ts,
+        prompt_tokens,
+        completion_tokens,
+        container="vibepod-tau-hm",
+    ):
         self._request(rid, "api.groq.com", "/openai/v1/chat/completions", container, "l3", ts=ts)
         self._response(
             rid,
             json.dumps(
-                {"usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+                {"usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}},
             ).encode(),
             ts=ts,
         )
 
     def test_daily_heatmaps_group_tokens_per_day(self):
-        day1 = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00+00:00")
-        day2 = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
+        day1 = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00+00:00")
+        day2 = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
         self._seed_usage_call("hm1", day1, 40, 4)
         self._seed_usage_call("hm2", day1, 60, 6)
         self._seed_usage_call("hm3", day2, 7, 70)
@@ -452,7 +460,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertGreaterEqual(len(idle), 300)
 
     def test_heatmaps_ignore_time_range_filter(self):
-        ts = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT10:00:00+00:00")
+        ts = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT10:00:00+00:00")
         self._seed_usage_call("hm4", ts, 5, 1)
         self.source.commit()
         self.refresh()
@@ -474,14 +482,21 @@ class AgentTokenSqlTests(unittest.TestCase):
 
     def test_long_ranges_extend_existing_charts(self):
         # Dedicated agent so static seeds can't drift between buckets over time.
-        ts = (datetime.now(timezone.utc) - timedelta(days=40)).strftime("%Y-%m-%dT10:00:00+00:00")
+        ts = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m-%dT10:00:00+00:00")
         self._seed_usage_call("hm6", ts, 11, 3, container="vibepod-hmx-1")
         self.source.commit()
         self.refresh()
 
-        query = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]["total_tokens"]["query"]
-        within_30d = self.conn.execute(query, dict(self.PARAMS, time_range="30d", agent="hmx")).fetchone()[0]
-        within_3m = self.conn.execute(query, dict(self.PARAMS, time_range="3m", agent="hmx")).fetchone()[0]
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        query = charts["total_tokens"]["query"]
+        within_30d = self.conn.execute(
+            query,
+            dict(self.PARAMS, time_range="30d", agent="hmx"),
+        ).fetchone()[0]
+        within_3m = self.conn.execute(
+            query,
+            dict(self.PARAMS, time_range="3m", agent="hmx"),
+        ).fetchone()[0]
 
         self.assertEqual(within_30d, 0)
         self.assertEqual(within_3m, 14)
@@ -490,12 +505,14 @@ class AgentTokenSqlTests(unittest.TestCase):
         # days=2 keeps this clear of the static 2026-07-26 claude seed: the
         # zero-token assertion below would fail on the one day now-2d lands on
         # it, and that date is already in the past.
-        ts = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00+00:00")
+        ts = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00+00:00")
         self._seed_usage_call("hm5", ts, 9, 2)
         self.source.commit()
         self.refresh()
 
-        claude_rows = {row[0]: row for row in self._heatmap_rows("daily_input_heatmap", agent="claude")}
+        claude_rows = {
+            row[0]: row for row in self._heatmap_rows("daily_input_heatmap", agent="claude")
+        }
         tau_rows = {row[0]: row for row in self._heatmap_rows("daily_input_heatmap", agent="tau")}
 
         self.assertEqual(claude_rows[ts[:10]][3], 0)
