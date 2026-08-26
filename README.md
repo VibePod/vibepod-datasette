@@ -10,7 +10,8 @@ Datasette container for browsing both VibePod SQLite databases:
 - agent sessions dashboard via `datasette-dashboards` at `/-/dashboards/agent-sessions`
 - agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
 - dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
-- `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`
+- `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
+  attributed to the workspace each call came from via `logs.db`
 
 ## Environment
 
@@ -58,7 +59,9 @@ It includes:
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
+- tokens by workspace, split into input vs output series, plus a count of active workspaces
 - tokens by agent and model table, including cached and cache-write columns
+- tokens by workspace and agent table
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
 
@@ -68,9 +71,49 @@ Available dashboard filters:
 - trend bucket (`auto`, `5min`, `hour`, `day`; `auto` uses 5-minute slots for `1h`,
   hourly for `24h`, and daily beyond that)
 - agent (derived from `source_container_name`, e.g. `vibepod-tau-...` -> `tau`)
+- workspace (the directory the agent ran in, resolved from `logs.db`; see below)
 - provider (`anthropic`, `openai-codex`, `google`, `groq`, ... derived from the request host)
 - host
 - table row limit
+
+### How tokens are attributed to a workspace
+
+Token counts come from `proxy.db`, but the directory an agent ran in only exists in
+`logs.db` as `sessions.workspace` — `http_requests` has no workspace column. Chart queries
+cannot join across databases (see the note at the end of this README), so
+`scripts/build_usage_cache.py` resolves the workspace while building the cache and stores
+it on the row. `logs.db` is opened **read-only**, like `proxy.db`; pass it with `--logs-db`
+(default `LOGS_DB_PATH`, already wired up in the container).
+
+The link between the two databases is the container:
+
+- **Primary key is the container id.** `sessions.container_id` and
+  `http_requests.source_container_id` are compared on their first 12 characters, because
+  Docker's short id is exactly the prefix of the full one and the two sides need not store
+  the same length. Container ids are never reused, so this needs no time logic at all.
+- **The container name is the fallback**, used when the proxy captured no id or the id
+  matches no session (a pruned `logs.db`, or a session predating the id column). The newest
+  session that started before the call wins, which covers containers pinned to a fixed name
+  via `vp run --name`. `ended_at` is deliberately ignored: a call made after a session ended
+  still comes from that container, and a container's workspace is bind-mounted at creation
+  and cannot change while it lives.
+
+The full path is stored, and the basename is used as the chart label — hovering a bar shows
+the whole path. Two checkouts sharing a basename remain separate rows.
+
+A call that resolves to no session is **not dropped**: it is counted under `unknown`, so the
+workspace totals still add up to the overall total. Because a call can cross the proxy before
+its session row lands in `logs.db`, resolution is retried on every refresh; a row that stays
+unresolved for 15 minutes after it was ingested is decided `unknown` once and not rescanned
+again. Run with `--full` to re-resolve everything after fixing a missing or misplaced
+`logs.db`.
+
+Every refresh logs its outcome (`workspace resolution: by_id=…, by_name=…, unknown=…,
+pending=…`), and two queries make the attribution auditable:
+`workspace_token_totals` (`/-/queries/usage/workspace_token_totals`) for the per-workspace
+sums, and `workspace_resolution` for the per-container breakdown of resolved and still
+pending rows. A dashboard dominated by `unknown` means the container link is not working —
+which is visible as a number rather than as silently misattributed tokens.
 
 ### Why there is a usage cache
 

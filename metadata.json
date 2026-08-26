@@ -53,6 +53,22 @@
             "tokens_by_provider"
           ],
           [
+            "tokens_by_workspace",
+            "tokens_by_workspace",
+            "tokens_by_workspace",
+            "tokens_by_workspace",
+            "active_workspaces",
+            "active_workspaces"
+          ],
+          [
+            "tokens_by_workspace_agent",
+            "tokens_by_workspace_agent",
+            "tokens_by_workspace_agent",
+            "tokens_by_workspace_agent",
+            "tokens_by_workspace_agent",
+            "tokens_by_workspace_agent"
+          ],
+          [
             "tokens_by_agent_model",
             "tokens_by_agent_model",
             "tokens_by_agent_model",
@@ -103,6 +119,13 @@
             "query": "SELECT agent FROM (SELECT 'all' AS agent, 0 AS ord UNION ALL SELECT DISTINCT agent, 1 AS ord FROM token_usage) ORDER BY ord, agent",
             "default": "all"
           },
+          "workspace": {
+            "name": "Workspace",
+            "type": "select",
+            "db": "usage",
+            "query": "SELECT workspace FROM (SELECT 'all' AS workspace, 0 AS ord UNION ALL SELECT DISTINCT workspace, 1 AS ord FROM agent_token_usage) ORDER BY ord, workspace",
+            "default": "all"
+          },
           "provider": {
             "name": "Provider",
             "type": "select",
@@ -133,7 +156,7 @@
           "total_tokens": {
             "title": "Total tokens (all agents)",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_tokens",
@@ -143,7 +166,7 @@
           "total_input_tokens": {
             "title": "Input tokens",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(input_tokens), 0) AS total_input_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(input_tokens), 0) AS total_input_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_input_tokens",
@@ -153,7 +176,7 @@
           "total_output_tokens": {
             "title": "Output tokens",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(output_tokens), 0) AS total_output_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(output_tokens), 0) AS total_output_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_output_tokens",
@@ -163,7 +186,7 @@
           "total_cached_tokens": {
             "title": "Cached input tokens",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(cached_tokens), 0) AS total_cached_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(cached_tokens), 0) AS total_cached_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_cached_tokens",
@@ -173,7 +196,7 @@
           "total_reasoning_tokens": {
             "title": "Reasoning tokens",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(reasoning_tokens), 0) AS total_reasoning_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(reasoning_tokens), 0) AS total_reasoning_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_reasoning_tokens",
@@ -183,7 +206,7 @@
           "total_cache_write_tokens": {
             "title": "Cache write tokens",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(cache_write_tokens), 0) AS total_cache_write_tokens FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(cache_write_tokens), 0) AS total_cache_write_tokens FROM priced",
             "library": "metric",
             "display": {
               "field": "total_cache_write_tokens",
@@ -193,7 +216,7 @@
           "calls_with_usage": {
             "title": "Calls with usage data",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COUNT(*) AS calls_with_usage FROM priced",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COUNT(*) AS calls_with_usage FROM priced",
             "library": "metric",
             "display": {
               "field": "calls_with_usage",
@@ -203,7 +226,7 @@
           "tokens_by_agent": {
             "title": "Tokens by agent (input vs output)",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, 'input' AS series, SUM(input_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY agent UNION ALL SELECT agent, 'output' AS series, SUM(output_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY agent ORDER BY agent, series",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, 'input' AS series, SUM(input_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY agent UNION ALL SELECT agent, 'output' AS series, SUM(output_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY agent ORDER BY agent, series",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -244,7 +267,7 @@
           "tokens_by_provider": {
             "title": "Tokens by provider (input vs output)",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT provider, 'input' AS series, SUM(input_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY provider UNION ALL SELECT provider, 'output' AS series, SUM(output_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY provider ORDER BY provider, series",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT provider, 'input' AS series, SUM(input_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY provider UNION ALL SELECT provider, 'output' AS series, SUM(output_tokens) AS tokens, COUNT(*) AS call_count FROM priced GROUP BY provider ORDER BY provider, series",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -285,7 +308,7 @@
           "token_trend": {
             "title": "Token trend (all agents)",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT bucket, series, tokens FROM (SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = '5min' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '1h') THEN datetime((strftime('%s', datetime(timestamp)) / 300) * 300, 'unixepoch') WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '24h') THEN strftime('%Y-%m-%d %H:00', datetime(timestamp)) ELSE strftime('%Y-%m-%d', datetime(timestamp)) END AS bucket, 'input' AS series, SUM(input_tokens) AS tokens FROM priced GROUP BY bucket UNION ALL SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = '5min' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '1h') THEN datetime((strftime('%s', datetime(timestamp)) / 300) * 300, 'unixepoch') WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '24h') THEN strftime('%Y-%m-%d %H:00', datetime(timestamp)) ELSE strftime('%Y-%m-%d', datetime(timestamp)) END AS bucket, 'output' AS series, SUM(output_tokens) AS tokens FROM priced GROUP BY bucket) ORDER BY bucket, series",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT bucket, series, tokens FROM (SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = '5min' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '1h') THEN datetime((strftime('%s', datetime(timestamp)) / 300) * 300, 'unixepoch') WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '24h') THEN strftime('%Y-%m-%d %H:00', datetime(timestamp)) ELSE strftime('%Y-%m-%d', datetime(timestamp)) END AS bucket, 'input' AS series, SUM(input_tokens) AS tokens FROM priced GROUP BY bucket UNION ALL SELECT CASE WHEN COALESCE(:time_bucket, 'auto') = '5min' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '1h') THEN datetime((strftime('%s', datetime(timestamp)) / 300) * 300, 'unixepoch') WHEN COALESCE(:time_bucket, 'auto') = 'hour' OR (COALESCE(:time_bucket, 'auto') = 'auto' AND COALESCE(:time_range, '24h') = '24h') THEN strftime('%Y-%m-%d %H:00', datetime(timestamp)) ELSE strftime('%Y-%m-%d', datetime(timestamp)) END AS bucket, 'output' AS series, SUM(output_tokens) AS tokens FROM priced GROUP BY bucket) ORDER BY bucket, series",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -315,28 +338,28 @@
           "tokens_by_agent_model": {
             "title": "Tokens by agent and model",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, model, provider, COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY agent, model, provider ORDER BY total_tokens DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, model, provider, COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY agent, model, provider ORDER BY total_tokens DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
             "library": "table",
             "display": {}
           },
           "usage_coverage": {
             "title": "Usage coverage by host (unparsed = tokens missing from totals)",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)) SELECT host, provider, COUNT(*) AS calls, SUM(has_usage) AS parsed_calls, SUM(1 - has_usage) AS unparsed_calls FROM filtered GROUP BY host, provider ORDER BY unparsed_calls DESC, calls DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)) SELECT host, provider, COUNT(*) AS calls, SUM(has_usage) AS parsed_calls, SUM(1 - has_usage) AS unparsed_calls FROM filtered GROUP BY host, provider ORDER BY unparsed_calls DESC, calls DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
             "library": "table",
             "display": {}
           },
           "recent_calls": {
             "title": "Recent calls with usage",
             "db": "usage",
-            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT timestamp, agent, provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, input_tokens + output_tokens AS total_tokens FROM priced ORDER BY datetime(timestamp) DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT timestamp, agent, provider, model, host, workspace_name, input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, input_tokens + output_tokens AS total_tokens FROM priced ORDER BY datetime(timestamp) DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
             "library": "table",
             "display": {}
           },
           "daily_input_heatmap": {
             "title": "Daily input tokens (past year)",
             "db": "usage",
-            "query": "WITH RECURSIVE filtered AS (SELECT * FROM agent_token_usage WHERE has_usage = 1 AND datetime(timestamp) >= datetime('now', '-365 days') AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), daily AS (SELECT date(timestamp) AS day, SUM(input_tokens) AS tokens, COUNT(*) AS calls FROM filtered GROUP BY day), days(day) AS (SELECT date('now', '-365 days') UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now')) SELECT days.day AS day, date(days.day, 'weekday 0', '-6 days') AS week, CASE strftime('%w', days.day) WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' ELSE 'Sun' END AS weekday, COALESCE(daily.tokens, 0) AS tokens, COALESCE(daily.calls, 0) AS calls FROM days LEFT JOIN daily ON daily.day = days.day ORDER BY days.day",
+            "query": "WITH RECURSIVE filtered AS (SELECT * FROM agent_token_usage WHERE has_usage = 1 AND datetime(timestamp) >= datetime('now', '-365 days') AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), daily AS (SELECT date(timestamp) AS day, SUM(input_tokens) AS tokens, COUNT(*) AS calls FROM filtered GROUP BY day), days(day) AS (SELECT date('now', '-365 days') UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now')) SELECT days.day AS day, date(days.day, 'weekday 0', '-6 days') AS week, CASE strftime('%w', days.day) WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' ELSE 'Sun' END AS weekday, COALESCE(daily.tokens, 0) AS tokens, COALESCE(daily.calls, 0) AS calls FROM days LEFT JOIN daily ON daily.day = days.day ORDER BY days.day",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -406,7 +429,7 @@
           "daily_output_heatmap": {
             "title": "Daily output tokens (past year)",
             "db": "usage",
-            "query": "WITH RECURSIVE filtered AS (SELECT * FROM agent_token_usage WHERE has_usage = 1 AND datetime(timestamp) >= datetime('now', '-365 days') AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), daily AS (SELECT date(timestamp) AS day, SUM(output_tokens) AS tokens, COUNT(*) AS calls FROM filtered GROUP BY day), days(day) AS (SELECT date('now', '-365 days') UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now')) SELECT days.day AS day, date(days.day, 'weekday 0', '-6 days') AS week, CASE strftime('%w', days.day) WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' ELSE 'Sun' END AS weekday, COALESCE(daily.tokens, 0) AS tokens, COALESCE(daily.calls, 0) AS calls FROM days LEFT JOIN daily ON daily.day = days.day ORDER BY days.day",
+            "query": "WITH RECURSIVE filtered AS (SELECT * FROM agent_token_usage WHERE has_usage = 1 AND datetime(timestamp) >= datetime('now', '-365 days') AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), daily AS (SELECT date(timestamp) AS day, SUM(output_tokens) AS tokens, COUNT(*) AS calls FROM filtered GROUP BY day), days(day) AS (SELECT date('now', '-365 days') UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now')) SELECT days.day AS day, date(days.day, 'weekday 0', '-6 days') AS week, CASE strftime('%w', days.day) WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' ELSE 'Sun' END AS weekday, COALESCE(daily.tokens, 0) AS tokens, COALESCE(daily.calls, 0) AS calls FROM days LEFT JOIN daily ON daily.day = days.day ORDER BY days.day",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -472,6 +495,90 @@
                 ]
               }
             }
+          },
+          "tokens_by_workspace": {
+            "title": "Tokens by workspace (input vs output)",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT y, series, SUM(tokens) AS tokens, MAX(workspace) AS workspace, SUM(call_count) AS call_count FROM (SELECT workspace_name AS y, 'input' AS series, SUM(input_tokens) AS tokens, workspace, COUNT(*) AS call_count FROM priced GROUP BY workspace UNION ALL SELECT workspace_name, 'output', SUM(output_tokens), workspace, COUNT(*) FROM priced GROUP BY workspace) GROUP BY y, series ORDER BY y, series",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "bar",
+                "tooltip": true
+              },
+              "encoding": {
+                "y": {
+                  "field": "y",
+                  "type": "nominal",
+                  "sort": {
+                    "op": "sum",
+                    "field": "tokens",
+                    "order": "descending"
+                  },
+                  "title": "Workspace"
+                },
+                "x": {
+                  "field": "tokens",
+                  "type": "quantitative",
+                  "title": "Tokens",
+                  "stack": "zero"
+                },
+                "color": {
+                  "field": "series",
+                  "type": "nominal",
+                  "title": "Tokens",
+                  "scale": {
+                    "domain": [
+                      "input",
+                      "output"
+                    ]
+                  }
+                },
+                "tooltip": [
+                  {
+                    "field": "y",
+                    "type": "nominal",
+                    "title": "Workspace"
+                  },
+                  {
+                    "field": "workspace",
+                    "type": "nominal",
+                    "title": "Path"
+                  },
+                  {
+                    "field": "tokens",
+                    "type": "quantitative",
+                    "title": "Tokens"
+                  },
+                  {
+                    "field": "series",
+                    "type": "nominal",
+                    "title": "Series"
+                  },
+                  {
+                    "field": "call_count",
+                    "type": "quantitative",
+                    "title": "Calls"
+                  }
+                ]
+              }
+            }
+          },
+          "active_workspaces": {
+            "title": "Active workspaces",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COUNT(DISTINCT workspace) AS active_workspaces FROM priced",
+            "library": "metric",
+            "display": {
+              "field": "active_workspaces",
+              "suffix": " workspaces"
+            }
+          },
+          "tokens_by_workspace_agent": {
+            "title": "Tokens by workspace and agent",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT workspace_name, agent, COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY workspace_name, agent ORDER BY total_tokens DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "library": "table"
           }
         }
       },
@@ -1702,15 +1809,15 @@
       "queries": {
         "agent_token_usage": {
           "title": "Agent token usage (normalized across providers)",
-          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT timestamp, agent, provider, model, host, request_id, source, input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, input_tokens + output_tokens AS total_tokens FROM priced ORDER BY datetime(timestamp) DESC LIMIT CAST(COALESCE(:limit, 200) AS INTEGER)"
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT timestamp, agent, provider, model, host, request_id, source, input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, input_tokens + output_tokens AS total_tokens FROM priced ORDER BY datetime(timestamp) DESC LIMIT CAST(COALESCE(:limit, 200) AS INTEGER)"
         },
         "agent_token_totals": {
           "title": "Token totals per agent",
-          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY agent ORDER BY total_tokens DESC"
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT agent, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY agent ORDER BY total_tokens DESC"
         },
         "agent_token_coverage": {
           "title": "Token usage coverage by host",
-          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host)) SELECT host, provider, COUNT(*) AS calls, SUM(has_usage) AS parsed_calls, SUM(1 - has_usage) AS unparsed_calls FROM filtered GROUP BY host, provider ORDER BY unparsed_calls DESC, calls DESC"
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)) SELECT host, provider, COUNT(*) AS calls, SUM(has_usage) AS parsed_calls, SUM(1 - has_usage) AS unparsed_calls FROM filtered GROUP BY host, provider ORDER BY unparsed_calls DESC, calls DESC"
         },
         "usage_cache_state": {
           "title": "Usage cache freshness",
@@ -1723,6 +1830,14 @@
         "agent_token_calls_per_connection": {
           "title": "Model calls per captured connection",
           "sql": "SELECT request_id, host, agent, COUNT(*) AS model_calls, COUNT(DISTINCT response_id) AS distinct_responses, SUM(input_tokens + output_tokens) AS total_tokens FROM agent_token_usage WHERE has_usage = 1 GROUP BY request_id, host, agent ORDER BY model_calls DESC, total_tokens DESC LIMIT CAST(COALESCE(:limit, 100) AS INTEGER)"
+        },
+        "workspace_token_totals": {
+          "name": "Tokens per workspace",
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT workspace, workspace_name, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY workspace_name, workspace ORDER BY total_tokens DESC"
+        },
+        "workspace_resolution": {
+          "name": "Workspace resolution diagnostics",
+          "sql": "SELECT container_id, container_name, workspace, workspace_name, COUNT(*) AS resolved_rows FROM token_usage WHERE workspace != '' GROUP BY container_id, container_name, workspace, workspace_name UNION ALL SELECT container_id, container_name, 'unknown-pending', '', COUNT(*) FROM token_usage WHERE workspace = '' GROUP BY container_id, container_name ORDER BY resolved_rows DESC"
         }
       }
     }

@@ -51,6 +51,7 @@ fi
     python /app/scripts/build_usage_cache.py \
       --proxy-db /data/proxy.db \
       --usage-db /data/usage.db \
+      --logs-db /data/logs.db \
       --loop \
       --interval "$USAGE_REFRESH_SECONDS" && break
     echo "usage cache refresher exited unexpectedly; restarting in 10s" >&2
