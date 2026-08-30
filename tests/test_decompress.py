@@ -193,6 +193,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         "agent": "all",
         "provider": "all",
         "host": "all",
+        "workspace": "all",
         "limit": 200,
         "request_limit": 100,
     }
@@ -209,6 +210,28 @@ class AgentTokenSqlTests(unittest.TestCase):
         timestamp TEXT, direction TEXT, type TEXT, content BLOB);
     """
 
+    LOGS_SCHEMA = """
+    -- Mirrors session_logger.py: the session fixture the resolver joins against.
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT, image TEXT,
+        workspace TEXT, container_id TEXT, container_name TEXT, started_at TEXT,
+        ended_at TEXT, exit_reason TEXT, vibepod_version TEXT);
+    """
+
+    def _session(self, container_id, container_name, workspace, started_at, session_id=None):
+        self.logs.execute(
+            "INSERT INTO sessions (id, agent, image, workspace, container_id, "
+            "container_name, started_at, ended_at, exit_reason, vibepod_version) "
+            "VALUES (?, 'agent', 'image', ?, ?, ?, ?, NULL, NULL, '')",
+            (
+                session_id or f"sess-{container_id}",
+                workspace,
+                container_id,
+                container_name,
+                started_at,
+            ),
+        )
+        self.logs.commit()
+
     def setUp(self):
         decompress._decode_cache.clear()
         decompress._usage_cache.clear()
@@ -216,15 +239,19 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.proxy_path = Path(self.tmp.name) / "proxy.db"
         self.usage_path = Path(self.tmp.name) / "usage.db"
+        self.logs_path = Path(self.tmp.name) / "logs.db"
         self.source = sqlite3.connect(self.proxy_path)
         self.addCleanup(self.source.close)
         self.source.executescript(self.SCHEMA)
+        self.logs = sqlite3.connect(self.logs_path)
+        self.addCleanup(self.logs.close)
+        self.logs.executescript(self.LOGS_SCHEMA)
         self.metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
         self._seed()
         self.refresh()
 
     def refresh(self):
-        counts = build_usage_cache.build(self.proxy_path, self.usage_path)
+        counts = build_usage_cache.build(self.proxy_path, self.usage_path, self.logs_path)
         self.conn = sqlite3.connect(self.usage_path)
         self.addCleanup(self.conn.close)
         return counts
@@ -236,12 +263,13 @@ class AgentTokenSqlTests(unittest.TestCase):
         path,
         container,
         model,
+        container_id=None,
         ts="2026-07-26T10:00:00+00:00",
     ):
         self.source.execute(
-            "INSERT INTO http_requests (id, timestamp, method, source_container_name, host, "
-            "path, body) VALUES (?, ?, 'POST', ?, ?, ?, ?)",
-            (rid, ts, container, host, path, json.dumps({"model": model}).encode()),
+            "INSERT INTO http_requests (id, timestamp, method, source_container_name, "
+            "source_container_id, host, path, body) VALUES (?, ?, 'POST', ?, ?, ?, ?, ?)",
+            (rid, ts, container, container_id, host, path, json.dumps({"model": model}).encode()),
         )
 
     def _response(self, rid, body, ts="2026-07-26T10:00:01+00:00"):
@@ -252,12 +280,28 @@ class AgentTokenSqlTests(unittest.TestCase):
         )
 
     def _seed(self):
+        # Two seeds resolve to different workspaces; the copilot row has no
+        # session and must land in the 'unknown' bucket instead of an empty label.
+        self._session(
+            "abc1id123456",
+            "vibepod-claude-abc1",
+            "/home/g/projects/alpha",
+            "2026-07-25T10:00:00+00:00",
+        )
+        self._session(
+            "abc2id123456",
+            "vibepod-tau-abc2",
+            "/home/g/projects/beta",
+            "2026-07-25T10:00:00+00:00",
+        )
+
         self._request(
             "r1",
             "api.anthropic.com",
             "/v1/messages",
             "vibepod-claude-abc1",
             "opus",
+            container_id="abc1id123456",
         )
         self._response(
             "r1",
@@ -275,6 +319,7 @@ class AgentTokenSqlTests(unittest.TestCase):
             "/openai/v1/chat/completions",
             "vibepod-tau-abc2",
             "l3",
+            container_id="abc2id123456",
         )
         self._response(
             "r2",
@@ -300,6 +345,13 @@ class AgentTokenSqlTests(unittest.TestCase):
             "/backend-api/codex/responses",
             "vibepod-codex-abc4",
             "c",
+            container_id="abc4id123456",
+        )
+        self._session(
+            "abc4id123456",
+            "vibepod-codex-abc4",
+            "/home/g/projects/gamma",
+            "2026-07-25T10:00:00+00:00",
         )
         self._response("r4", b'{"ok":true}')
         self.source.execute(
@@ -320,8 +372,22 @@ class AgentTokenSqlTests(unittest.TestCase):
         )
         self.source.commit()
 
+    def _workspace(self, agent=None):
+        params = dict(self.PARAMS)
+        if agent is not None:
+            params["agent"] = agent
+        sql = self.metadata["databases"]["usage"]["queries"]["workspace_token_totals"]["sql"]
+        return {row[1]: row for row in self.conn.execute(sql, params).fetchall()}
+
     def _rows(self, sql):
         return self.conn.execute(sql, self.PARAMS).fetchall()
+
+    def _stored_workspace(self, request_id):
+        """The raw, un-normalized workspace of a row ('' while still pending)."""
+        return self.conn.execute(
+            "SELECT workspace FROM token_usage WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0]
 
     def test_totals_sum_every_agent_once(self):
         sql = self.metadata["databases"]["usage"]["queries"]["agent_token_totals"]["sql"]
@@ -334,6 +400,32 @@ class AgentTokenSqlTests(unittest.TestCase):
         # One row only: the HTTP twin of the websocket call must not be counted.
         self.assertEqual(totals["codex"][1], 1)
         self.assertEqual(totals["codex"][7], 790)
+
+    def test_workspace_totals_sum_across_all_workspaces(self):
+        # With usage but without a session: the row must count toward 'unknown'
+        # instead of silently dropping out of every bucket.
+        self._request("w1", "api.groq.com", "/v1/chat", "vibepod-tau-nowhere", "l3")
+        self._response(
+            "w1",
+            json.dumps({"usage": {"prompt_tokens": 5, "completion_tokens": 1}}).encode(),
+        )
+        self.source.commit()
+        self.refresh()
+
+        workspaces = self._workspace()
+
+        self.assertEqual(
+            sorted(workspaces),
+            ["alpha", "beta", "gamma", "unknown"],
+        )
+        # Nothing falls out of the totals: unknown buckets make gaps visible.
+        total = sum(row[8] for row in workspaces.values())
+        self.assertEqual(total, 1500 + 100 + 790 + 6)
+        self.assertEqual(workspaces["alpha"][0], "/home/g/projects/alpha")
+        self.assertEqual(workspaces["alpha"][8], 1500)  # claude seed resolved by id
+        self.assertEqual(workspaces["beta"][8], 100)
+        self.assertEqual(workspaces["gamma"][8], 790)
+        self.assertEqual(workspaces["unknown"][8], 6)
 
     def test_coverage_lists_calls_without_usage(self):
         sql = self.metadata["databases"]["usage"]["queries"]["agent_token_coverage"]["sql"]
@@ -382,7 +474,11 @@ class AgentTokenSqlTests(unittest.TestCase):
             if chart["library"] != "metric":
                 continue
             with self.subTest(chart=name):
-                expected = " calls" if name == "calls_with_usage" else " tok"
+                expected = (
+                    " calls"
+                    if name == "calls_with_usage"
+                    else (" workspaces" if name == "active_workspaces" else " tok")
+                )
                 self.assertEqual(chart["display"]["suffix"], expected)
 
     def test_cache_write_card_sums_cache_creation_tokens(self):
@@ -794,7 +890,9 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.addCleanup(conn.close)
         columns = [row[1] for row in conn.execute("PRAGMA table_info(token_usage)")]
         self.assertIn("response_id", columns)
-        self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 2)
+        for col in ("container_id", "container_name", "workspace", "workspace_name"):
+            self.assertIn(col, columns)
+        self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
         # The stale watermark was dropped, so everything is re-parsed.
         self.assertGreater(counts["http"], 0)
 
@@ -862,6 +960,293 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(sorted(state), ["http", "ws"])
         self.assertGreater(state["http"][1], 0)
         self.assertEqual(state["http"][3], 4)
+
+    seed_container = "vibepod-claude-abc1"
+
+    def test_container_id_match_beats_ambiguous_name(self):
+        # A second, newer session shares the container name but has a different
+        # id and workspace; the id lookup must win over the name ambiguity.
+        self._session(
+            "aaa1id000001",
+            self.seed_container,
+            "/elsewhere/clone",
+            "2026-07-25T11:00:00+00:00",
+        )
+        self._request(
+            "cim",
+            "api.groq.com",
+            "/v1/chat",
+            self.seed_container,
+            "opus",
+            container_id="abc1id123456",
+            ts="2026-07-26T10:05:00+00:00",
+        )
+        self._response(
+            "cim",
+            json.dumps({"usage": {"prompt_tokens": 9}}).encode(),
+            ts="2026-07-26T10:05:00+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+
+        workspaces = self._workspace(agent="claude")
+
+        self.assertEqual(
+            list(workspaces),
+            ["alpha"],  # a name match would have picked the newer 'clone' workspace
+        )
+
+    def test_container_id_prefix_matches_full_id(self):
+        self._request(
+            "cid1",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-prefix",
+            "l3",
+            container_id="abc2id123456",
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self._response(
+            "cid1",
+            json.dumps({"usage": {"prompt_tokens": 5}}).encode(),
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+
+        workspaces = self._workspace(agent="tau")
+
+        self.assertIn("beta", workspaces)
+
+    def test_name_fallback_prefers_latest_session_before_call(self):
+        # A call whose id matches no session (logs.db pruned) still resolves by
+        # name; of two sessions with that name the newest one started before
+        # the call wins, and the one started after it is ignored.
+        self._session(
+            "nev1id000001",
+            "vibepod-tau-fb",
+            "/elsewhere/clone/new",
+            "2026-07-25T11:00:00+00:00",
+        )
+        self._session(
+            "nev2id000002",
+            "vibepod-tau-fb",
+            "/elsewhere/clone/old",
+            "2026-07-25T09:00:00+00:00",
+        )
+        self._session(
+            "nev3id000003",
+            "vibepod-tau-fb",
+            "/elsewhere/clone/later",
+            "2026-07-27T09:00:00+00:00",
+        )
+        self._request(
+            "fb",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-fb",
+            "l3",
+            container_id="gone0id00001",
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self._response(
+            "fb",
+            json.dumps({"usage": {"prompt_tokens": 6}}).encode(),
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+
+        workspaces = self._workspace(agent="tau")
+
+        self.assertIn("new", workspaces)
+        self.assertNotIn("old", workspaces)
+        self.assertNotIn("later", workspaces)
+
+    def test_bare_meta_workspace_name_is_basename_even_for_trailing_slash(self):
+        self._session(
+            "nev3id000003",
+            "vibepod-tau-trailing",
+            "/home/g/projects/delta/",
+            "2026-07-25T11:00:00+00:00",
+        )
+        self._request(
+            "twl",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-trailing",
+            "l3",
+            container_id="nev3id000003",
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self._response(
+            "twl",
+            json.dumps({"usage": {"prompt_tokens": 3}}).encode(),
+            ts="2026-07-26T10:01:00+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+
+        workspaces = self._workspace(agent="tau")
+
+        self.assertIn("delta", workspaces)
+
+    def test_refresh_resolves_rows_parsed_before_their_session(self):
+        # Session row arrives in logs.db only after the call was parsed: the
+        # resolution pass must re-resolve pending rows on the next refresh.
+        self._request(
+            "late",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-tau-late",
+            "l3",
+            container_id="lateid00000001",
+            ts="2026-07-26T10:02:00+00:00",
+        )
+        self._response(
+            "late",
+            json.dumps({"usage": {"prompt_tokens": 4}}).encode(),
+            ts="2026-07-26T10:02:00+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+        self._session(
+            "lateid00000001",
+            "vibepod-tau-late",
+            "/elsewhere/later",
+            "2026-07-26T10:01:00+00:00",
+        )
+        self.logs.commit()
+        self.refresh()
+
+        workspaces = self._workspace(agent="tau")
+
+        self.assertIn("later", workspaces)
+
+    def test_grace_period_marks_unresolvable_rows_unknown_only(self):
+        # The grace window counts from ingest, not from the call timestamp: a
+        # freshly parsed row stays pending however old the traffic is, so a
+        # session arriving later can still claim it. Once the window closes the
+        # row is decided 'unknown' exactly once and never re-scanned.
+        old_ts = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        self._request("grc", "api.groq.com", "/v1/chat", "vibepod-grc-1", "l3", ts=old_ts)
+        self._response("grc", json.dumps({"usage": {"prompt_tokens": 2}}).encode(), ts=old_ts)
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_workspace("grc"), "")
+
+        counts = build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
+        self.assertEqual(self._stored_workspace("grc"), "unknown")
+        self.assertGreaterEqual(counts["unknown"], 1)
+        # Decided once: a later pass no longer sees the row at all.
+        counts = build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
+        self.assertEqual(counts["unknown"], 0)
+        self.assertEqual(self._stored_workspace("grc"), "unknown")
+
+    def test_workspace_chart_sums_workspaces_sharing_a_basename(self):
+        # Two checkouts named 'api' under different parents share the bar label:
+        # the chart must add their tokens up instead of reporting one of them.
+        self._session(
+            "dup1id000001",
+            "vibepod-tau-dup1",
+            "/home/g/a/api",
+            "2026-07-25T10:00:00+00:00",
+        )
+        self._session(
+            "dup2id000002",
+            "vibepod-tau-dup2",
+            "/home/g/b/api",
+            "2026-07-25T10:00:00+00:00",
+        )
+        for rid, cid, tokens in (("dup1", "dup1id000001", 10), ("dup2", "dup2id000002", 20)):
+            self._request(
+                rid,
+                "api.groq.com",
+                "/v1/chat",
+                f"vibepod-tau-{rid}",
+                "l3",
+                container_id=cid,
+            )
+            self._response(rid, json.dumps({"usage": {"prompt_tokens": tokens}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        sql = charts["tokens_by_workspace"]["query"]
+        rows = {(row[0], row[1]): row for row in self.conn.execute(sql, self.PARAMS).fetchall()}
+
+        self.assertEqual(rows[("api", "input")][2], 30)
+        self.assertEqual(rows[("api", "input")][4], 2)
+
+    def test_every_chart_query_references_workspace_filter(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        for name, chart in charts.items():
+            with self.subTest(chart=name):
+                self.assertIn(":workspace", chart["query"])
+
+    def test_resolution_diagnostic_counts_unresolved_containers(self):
+        # The diagnostics query buckets unresolved containers separately so a
+        # broken id match shows up as a number, not a silent mis-association.
+        sql = self.metadata["databases"]["usage"]["queries"]["workspace_resolution"]["sql"]
+
+        rows = self.conn.execute(sql).fetchall()
+
+        containers = {row[0] for row in rows}
+        self.assertIn("abc1id123456", containers)
+        # the copilot seed (no session) must not blend into 'unknown' invisible
+        self.assertIn("", containers)
+
+    def test_empty_workspace_labels_are_never_exposed(self):
+        # The view normalizes both columns; no chart may ever show a blank label.
+        rows = self.conn.execute(
+            "SELECT DISTINCT workspace, workspace_name FROM agent_token_usage",
+        ).fetchall()
+
+        self.assertNotIn("", [v for pair in rows for v in pair])
+
+    def test_resolve_workspace_unit(self):
+        alpha = ("abc1id123456", "vibepod-claude-abc1", "/hs/alpha", "alpha")
+        windows = [
+            (*alpha, "2026-07-25T10:00:00+00:00"),
+            ("xbc1idzzzzzz", "vibepod-clone", "/hs/clone", "clone", "2026-07-25T10:00:00+00:00"),
+        ]
+        ts = build_usage_cache._parse_ts("2026-07-26T10:00:00+00:00")
+        by_id = build_usage_cache.resolve_workspace("abc1id123456", "vibepod-other", ts, windows)
+        self.assertEqual(by_id, ("/hs/alpha", "alpha", "by_id"))
+        by_name = build_usage_cache.resolve_workspace("", "vibepod-clone", ts, windows)
+        self.assertEqual(by_name, ("/hs/clone", "clone", "by_name"))
+        # An id that matches no session still falls back to the name.
+        stale_id = build_usage_cache.resolve_workspace("zzz1idxxxxxx", "vibepod-clone", ts, windows)
+        self.assertEqual(stale_id, ("/hs/clone", "clone", "by_name"))
+        self.assertIsNone(build_usage_cache.resolve_workspace("", "vibepod-nope", ts, windows))
+        self.assertIsNone(
+            build_usage_cache.resolve_workspace("abc1idxxxxxx", "vibepod-nope", ts, windows),
+        )
+
+    def test_resolution_beats_the_grace_decision(self):
+        # A row that can be resolved gets its workspace even when it is far
+        # older than the grace period; resolution precedes the grace decision.
+        old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        started = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        self._request(
+            "grz",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-grz-1",
+            "l3",
+            container_id="grz1id000002",
+            ts=old,
+        )
+        self._response("grz", json.dumps({"usage": {"prompt_tokens": 1}}).encode(), ts=old)
+        self._session("grz1id000002", "vibepod-grz-1", "/elsewhere/resolved", started)
+        self.source.commit()
+        self.refresh()
+        build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
+
+        workspaces = self._workspace(agent="grz")
+
+        self.assertIn("resolved", workspaces)
 
     def test_agent_name_parsing(self):
         self.assertEqual(

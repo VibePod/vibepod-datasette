@@ -20,7 +20,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - exercised via the container image
 
 # Bump when the stored columns or their meaning change; open_cache() then drops
 # the cache and re-parses, because old rows cannot be upgraded in place.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -56,8 +56,36 @@ CREATE TABLE IF NOT EXISTS token_usage (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
     has_usage          INTEGER NOT NULL DEFAULT 0,
+    container_id       TEXT NOT NULL DEFAULT '',
+    container_name     TEXT NOT NULL DEFAULT '',
+    workspace          TEXT NOT NULL DEFAULT '',
+    workspace_name     TEXT NOT NULL DEFAULT '',
+    -- When this row was written, which is what the resolution grace period
+    -- counts from. The call's own timestamp cannot serve: backfilling an
+    -- existing proxy.db reads calls that are days old, and those must still
+    -- get their grace window before they are frozen as 'unknown'.
+    ingested_at        TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (source, row_id)
 );
+
+-- Snapshot of logs.db sessions, refilled on every refresh. Workspace
+-- resolution matches a call to the session of its container; Docker bundle
+-- ids are reused for container names, so the id (12-char prefix) is the
+-- reliable key, the name only a fallback.
+CREATE TABLE IF NOT EXISTS session_windows (
+    container_id12   TEXT NOT NULL,
+    container_name   TEXT NOT NULL,
+    workspace        TEXT NOT NULL,
+    workspace_name   TEXT NOT NULL,
+    started_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_windows_id ON session_windows(container_id12);
+CREATE INDEX IF NOT EXISTS idx_session_windows_name ON session_windows(container_name, started_at);
+
+-- Rows whose workspace has not been resolved yet; the partial index keeps
+-- rescans cheap. Unresolvable rows age out after GRACE_SECONDS below and are
+-- decided 'unknown' once, so they are not retried on every refresh.
+CREATE INDEX IF NOT EXISTS idx_token_usage_pending ON token_usage(workspace) WHERE workspace = '';
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage(agent);
@@ -78,8 +106,37 @@ CREATE TABLE IF NOT EXISTS sync_state (
 --      response id is present, keep a single row per (request_id, response_id)
 --      -- the one reporting the most tokens, since a later snapshot may be the
 --      complete one.
+-- Explicit column list so the workspace columns can be normalized: rows
+-- whose resolution is still pending would otherwise surface an empty label,
+-- which is exactly the bucket the 'unknown' fallback avoids.
 CREATE VIEW IF NOT EXISTS agent_token_usage AS
-SELECT * FROM token_usage t
+SELECT
+    t.source,
+    t.row_id,
+    t.request_id,
+    t.response_id,
+    t.timestamp,
+    t.agent,
+    t.provider,
+    t.model,
+    t.host,
+    t.input_tokens,
+    t.output_tokens,
+    t.cached_tokens,
+    t.cache_write_tokens,
+    t.reasoning_tokens,
+    t.has_usage,
+    t.container_id,
+    t.container_name,
+    CASE
+        WHEN t.workspace = '' THEN 'unknown'
+        ELSE t.workspace
+    END AS workspace,
+    CASE
+        WHEN t.workspace_name = '' THEN 'unknown'
+        ELSE t.workspace_name
+    END AS workspace_name
+FROM token_usage t
 WHERE (
         t.source = 'ws'
         OR NOT EXISTS (
@@ -102,7 +159,7 @@ WHERE (
 
 HTTP_SQL = """
 SELECT resp.id, r.id, COALESCE(r.timestamp, resp.timestamp), r.source_container_name,
-       r.host, r.body, resp.body
+       r.source_container_id, r.host, r.body, resp.body
 FROM http_responses resp
 JOIN http_requests r ON r.id = resp.request_id
 WHERE resp.id > ? AND r.method = 'POST' AND resp.body IS NOT NULL AND length(resp.body) > 0
@@ -111,7 +168,8 @@ LIMIT ?
 """
 
 WS_SQL = """
-SELECT ws.id, r.id, ws.timestamp, r.source_container_name, r.host, r.body, ws.content
+SELECT ws.id, r.id, ws.timestamp, r.source_container_name, r.source_container_id,
+       r.host, r.body, ws.content
 FROM websocket_messages ws
 JOIN http_requests r ON r.id = ws.request_id
 WHERE ws.id > ?
@@ -163,7 +221,10 @@ def open_cache(path: Path) -> sqlite3.Connection:
         conn.executescript(
             "DROP VIEW IF EXISTS agent_token_usage;"
             "DROP TABLE IF EXISTS token_usage;"
-            "DROP TABLE IF EXISTS sync_state;",
+            "DROP TABLE IF EXISTS sync_state;"
+            # Refilled from logs.db on every refresh, so dropping it costs
+            # nothing and keeps a later column change from being missed here.
+            "DROP TABLE IF EXISTS session_windows;",
         )
     conn.executescript(SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -195,7 +256,18 @@ def set_watermark(cache: sqlite3.Connection, source: str, row_id: int) -> None:
     )
 
 
-def _row_values(source, row_id, request_id, ts, container, host, request_body, payload):
+def _row_values(
+    source,
+    row_id,
+    request_id,
+    ts,
+    container,
+    container_id,
+    host,
+    request_body,
+    payload,
+    ingested_at="",
+):
     usage = json.loads(_extract_usage(payload, host))
     # The response payload names the model for the call that actually ran; the
     # request body is only a fallback (a websocket upgrade carries no model, and
@@ -217,13 +289,24 @@ def _row_values(source, row_id, request_id, ts, container, host, request_body, p
         int(usage.get("cache_write") or 0),
         int(usage.get("reasoning") or 0),
         int(usage.get("found") or 0),
+        # Docker's short id is the prefix of the full one, so truncating here
+        # matches either length to the session's container_id.
+        (container_id or "")[:12],
+        container or "",
+        # Workspace is resolved in the dedicated pass after ingest, because the
+        # session row may only appear in logs.db after the call was captured.
+        "",
+        "",
+        ingested_at or datetime.now(UTC).isoformat(),
     )
 
 
 INSERT_SQL = (
     "INSERT INTO token_usage (source, row_id, request_id, response_id, timestamp, agent, "
     "provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, "
-    "reasoning_tokens, has_usage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "reasoning_tokens, has_usage, container_id, container_name, workspace, workspace_name, "
+    "ingested_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT(source, row_id) DO NOTHING"
 )
 
@@ -244,7 +327,8 @@ def sync_source(source, sql, src, cache, batch_size, max_rows):
                 cache.commit()
             break
 
-        values = [_row_values(source, *row) for row in rows]
+        ingested_at = datetime.now(UTC).isoformat()
+        values = [_row_values(source, *row, ingested_at=ingested_at) for row in rows]
         cache.executemany(INSERT_SQL, values)
         set_watermark(cache, source, int(rows[-1][0]))
         cache.commit()
@@ -254,14 +338,151 @@ def sync_source(source, sql, src, cache, batch_size, max_rows):
     return processed
 
 
-def build(proxy_path: Path, usage_path: Path, batch_size=500, max_rows=0, full=False):
+GRACE_SECONDS = 15 * 60
+
+
+def _parse_ts(value: str) -> datetime | None:
+    """Parse a timestamp from either source db; naive strings are assumed UTC."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def resolve_workspace(container_id12: str, container_name: str, ts, windows):
+    """Match a call to its container's session: exact id first, name fallback.
+
+    The id match needs no time logic, because Docker container ids are never
+    reused. The name fallback covers rows the proxy captured without an id and
+    rows whose id matches no session at all (logs.db pruned, or a session that
+    predates the id column); there the newest session that started before the
+    call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
+    after session end from the same container still inherits that container's
+    workspace. Returns (workspace, workspace_name, resolution_path) or None.
+    """
+    for id12, _name, workspace, workspace_name, _started_at in windows:
+        if id12 and id12 == container_id12:
+            return (workspace, workspace_name, "by_id")
+    best = None  # newest session started before the call
+    best_started = None
+    for _id12, name, workspace, workspace_name, started_at in windows:
+        if name != container_name:
+            continue
+        started = _parse_ts(started_at)
+        if started is None:
+            continue
+        if ts is not None and started > ts:
+            continue
+        if best_started is None or started > best_started:
+            best, best_started = (workspace, workspace_name), started
+    if best is None:
+        return None
+    return (best[0], best[1], "by_name")
+
+
+def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
+    """Refresh session_windows, then resolve every pending token_usage row.
+
+    Rows that fail resolution AND were ingested longer ago than the grace
+    period are decided 'unknown' once, so they do not get rescanned on every
+    refresh. Recently ingested rows stay pending so a session row arriving in
+    logs.db later still resolves them.
+    Returns resolution counts for the log line.
+    """
+    if not logs_path.exists() or not table_exists(cache, "session_windows"):
+        return None
+    logs = open_source(logs_path)
+    try:
+        if not table_exists(logs, "sessions"):
+            return None
+        rows = logs.execute(
+            "SELECT container_id, container_name, workspace, started_at FROM sessions",
+        ).fetchall()
+    finally:
+        logs.close()
+    windows = tuple(
+        (
+            (row[0] or "")[:12],
+            row[1] or "",
+            row[2] or "",
+            Path(row[2] or "").name or row[2] or "",
+            row[3] or "",
+        )
+        for row in rows
+    )
+    cache.execute("DELETE FROM session_windows")
+    cache.executemany(
+        "INSERT INTO session_windows (container_id12, container_name, workspace, "
+        "workspace_name, started_at) VALUES (?, ?, ?, ?, ?)",
+        windows,
+    )
+    pending = cache.execute(
+        "SELECT source, row_id, container_id, container_name, timestamp, ingested_at "
+        "FROM token_usage WHERE workspace = ''",
+    ).fetchall()
+    deadline = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+    updates = []
+    counts = {"by_id": 0, "by_name": 0, "unknown": 0, "pending": 0}
+    for source, row_id, id12, name, ts, ingested_at in pending:
+        resolved = resolve_workspace(id12, name, _parse_ts(ts), windows)
+        workspace = None
+        if resolved is not None:
+            (workspace, workspace_name, path) = resolved
+            counts[path] += 1
+        else:
+            # An unparseable ingest stamp must still age out, otherwise the row
+            # is rescanned on every refresh forever.
+            ingested = _parse_ts(ingested_at)
+            if ingested is None or ingested <= deadline:
+                workspace = "unknown"
+                workspace_name = "unknown"
+                counts["unknown"] += 1
+            else:
+                counts["pending"] += 1
+        if workspace is not None:
+            updates.append((workspace, workspace_name, source, row_id))
+    if updates:
+        cache.executemany(
+            "UPDATE token_usage SET workspace = ?, workspace_name = ? "
+            "WHERE source = ? AND row_id = ?",
+            updates,
+        )
+    cache.commit()
+    return counts
+
+
+def _log_workspace_counts(counts) -> None:
+    if counts is None:
+        return
+    print(
+        "workspace resolution: " + ", ".join(f"{k}={v}" for k, v in counts.items()),
+        flush=True,
+    )
+
+
+def build(
+    proxy_path: Path,
+    usage_path: Path,
+    logs_path: Path | None = None,
+    batch_size=500,
+    max_rows=0,
+    full=False,
+):
     cache = open_cache(usage_path)
     if full:
         cache.execute("DELETE FROM token_usage")
         cache.execute("DELETE FROM sync_state")
+        cache.execute("DELETE FROM session_windows")
         cache.commit()
 
     if not proxy_path.exists():
+        if logs_path is not None:
+            _log_workspace_counts(sync_workspace(logs_path, cache))
         cache.close()
         return {"http": 0, "ws": 0}
 
@@ -279,6 +500,8 @@ def build(proxy_path: Path, usage_path: Path, batch_size=500, max_rows=0, full=F
             )
         if table_exists(src, "websocket_messages"):
             counts["ws"] = sync_source("ws", WS_SQL, src, cache, batch_size, max_rows)
+        if logs_path is not None:
+            _log_workspace_counts(sync_workspace(logs_path, cache))
     finally:
         src.close()
         cache.close()
@@ -294,6 +517,11 @@ def main() -> int:
     parser.add_argument(
         "--usage-db",
         default=os.environ.get("USAGE_DB_PATH", "/data/usage.db"),
+    )
+    parser.add_argument(
+        "--logs-db",
+        default=os.environ.get("LOGS_DB_PATH", "/data/logs.db"),
+        help="session log database used to resolve workspaces",
     )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument(
@@ -321,6 +549,7 @@ def main() -> int:
 
     proxy_path = Path(args.proxy_db)
     usage_path = Path(args.usage_db)
+    logs_path = Path(args.logs_db)
 
     while True:
         started = time.time()
@@ -328,6 +557,7 @@ def main() -> int:
             counts = build(
                 proxy_path,
                 usage_path,
+                logs_path=logs_path,
                 batch_size=args.batch_size,
                 max_rows=args.max_rows,
                 full=args.full,
