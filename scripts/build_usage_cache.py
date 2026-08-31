@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - exercised via the container image
 # tables/views and rebuilds them, because old rows/columns cannot be upgraded
 # in place. model_pricing is cheap to drop: it holds no captured data, only a
 # full reload of pricing/model_prices.json on the next refresh.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS token_usage (
     has_usage          INTEGER NOT NULL DEFAULT 0,
     container_id       TEXT NOT NULL DEFAULT '',
     container_name     TEXT NOT NULL DEFAULT '',
+    profile            TEXT NOT NULL DEFAULT '',
     workspace          TEXT NOT NULL DEFAULT '',
     workspace_name     TEXT NOT NULL DEFAULT '',
     -- When this row was written, which is what the resolution grace period
@@ -131,6 +132,7 @@ SELECT
     t.has_usage,
     t.container_id,
     t.container_name,
+    t.profile,
     CASE
         WHEN t.workspace = '' THEN 'unknown'
         ELSE t.workspace
@@ -255,7 +257,7 @@ LEFT JOIN model_pricing mp
 
 HTTP_SQL = """
 SELECT resp.id, r.id, COALESCE(r.timestamp, resp.timestamp), r.source_container_name,
-       r.source_container_id, r.host, r.body, resp.body
+       r.source_container_id, r.profile, r.host, r.body, resp.body
 FROM http_responses resp
 JOIN http_requests r ON r.id = resp.request_id
 WHERE resp.id > ? AND r.method = 'POST' AND resp.body IS NOT NULL AND length(resp.body) > 0
@@ -265,7 +267,7 @@ LIMIT ?
 
 WS_SQL = """
 SELECT ws.id, r.id, ws.timestamp, r.source_container_name, r.source_container_id,
-       r.host, r.body, ws.content
+       r.profile, r.host, r.body, ws.content
 FROM websocket_messages ws
 JOIN http_requests r ON r.id = ws.request_id
 WHERE ws.id > ?
@@ -368,6 +370,7 @@ def _row_values(
     ts,
     container,
     container_id,
+    profile,
     host,
     request_body,
     payload,
@@ -398,6 +401,7 @@ def _row_values(
         # matches either length to the session's container_id.
         (container_id or "")[:12],
         container or "",
+        profile or "",
         # Workspace is resolved in the dedicated pass after ingest, because the
         # session row may only appear in logs.db after the call was captured.
         "",
@@ -409,9 +413,9 @@ def _row_values(
 INSERT_SQL = (
     "INSERT INTO token_usage (source, row_id, request_id, response_id, timestamp, agent, "
     "provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, "
-    "reasoning_tokens, has_usage, container_id, container_name, workspace, workspace_name, "
-    "ingested_at) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "reasoning_tokens, has_usage, container_id, container_name, profile, workspace, "
+    "workspace_name, ingested_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT(source, row_id) DO NOTHING"
 )
 

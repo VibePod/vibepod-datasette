@@ -200,8 +200,8 @@ class AgentTokenSqlTests(unittest.TestCase):
 
     SCHEMA = """
     CREATE TABLE http_requests (id TEXT PRIMARY KEY, timestamp TEXT, method TEXT,
-        source_container_id TEXT, source_container_name TEXT, scheme TEXT, host TEXT,
-        port INTEGER, path TEXT, query TEXT, url TEXT, headers TEXT, body BLOB,
+        source_container_id TEXT, source_container_name TEXT, profile TEXT, scheme TEXT,
+        host TEXT, port INTEGER, path TEXT, query TEXT, url TEXT, headers TEXT, body BLOB,
         client_ip TEXT, client_port INTEGER, server_ip TEXT, server_port INTEGER);
     CREATE TABLE http_responses (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT,
         timestamp TEXT, status_code INTEGER, headers TEXT, body BLOB, bytes_in INTEGER,
@@ -265,11 +265,22 @@ class AgentTokenSqlTests(unittest.TestCase):
         model,
         container_id=None,
         ts="2026-07-26T10:00:00+00:00",
+        profile=None,
     ):
         self.source.execute(
             "INSERT INTO http_requests (id, timestamp, method, source_container_name, "
-            "source_container_id, host, path, body) VALUES (?, ?, 'POST', ?, ?, ?, ?, ?)",
-            (rid, ts, container, container_id, host, path, json.dumps({"model": model}).encode()),
+            "source_container_id, profile, host, path, body) "
+            "VALUES (?, ?, 'POST', ?, ?, ?, ?, ?, ?)",
+            (
+                rid,
+                ts,
+                container,
+                container_id,
+                profile,
+                host,
+                path,
+                json.dumps({"model": model}).encode(),
+            ),
         )
 
     def _response(self, rid, body, ts="2026-07-26T10:00:01+00:00"):
@@ -427,6 +438,36 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(workspaces["gamma"][8], 790)
         self.assertEqual(workspaces["unknown"][8], 6)
 
+    def test_profile_flows_from_http_requests_to_agent_token_usage(self):
+        self._request(
+            "p1",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-work",
+            "opus",
+            profile="work",
+        )
+        self._response(
+            "p1",
+            json.dumps({"usage": {"input_tokens": 10, "output_tokens": 2}}).encode(),
+        )
+        self.source.commit()
+        self.refresh()
+
+        profile = self.conn.execute(
+            "SELECT profile FROM agent_token_usage WHERE request_id = 'p1'",
+        ).fetchone()[0]
+
+        self.assertEqual(profile, "work")
+
+    def test_profile_defaults_to_empty_string_when_unresolved(self):
+        # r1 was seeded without a profile (unmapped source IP, e.g.).
+        profile = self.conn.execute(
+            "SELECT profile FROM agent_token_usage WHERE request_id = 'r1'",
+        ).fetchone()[0]
+
+        self.assertEqual(profile, "")
+
     def test_coverage_lists_calls_without_usage(self):
         sql = self.metadata["databases"]["usage"]["queries"]["agent_token_coverage"]["sql"]
 
@@ -517,17 +558,40 @@ class AgentTokenSqlTests(unittest.TestCase):
             for row in self.conn.execute(charts["cost_by_agent"]["query"], self.PARAMS).fetchall()
         }
 
-        # Real spend must not include the seeded codex call: it's flat-rate
-        # subscription traffic, priced only as an is_estimated value.
-        self.assertAlmostEqual(total_cost, 5.0 + 25.0)
+        # The seeded codex call (r4: 700 input / 90 output tokens) counts as
+        # real spend too: Codex/Copilot here authenticate with a metered API
+        # key, not a flat-rate plan, so openai-codex is not is_estimated.
+        codex_cost = round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4)
+        self.assertAlmostEqual(total_cost, 5.0 + 25.0 + codex_cost)
         self.assertAlmostEqual(by_agent["claude"], 5.0 + 25.0)
-        self.assertNotIn("codex", by_agent)
+        self.assertAlmostEqual(by_agent["codex"], codex_cost)
 
-    def test_dashboard_estimated_value_charts_cover_subscription_calls(self):
-        # The seeded codex call (r4: 700 input / 90 output tokens) has no
-        # provider-specific price, so it lands on the openai-codex catch-all
-        # ($1.25/$10 per 1M, is_estimated). This is the "what would this have
-        # cost on a metered API" figure, kept out of total_cost/cost_by_agent.
+    def test_dashboard_estimated_value_charts_cover_unverified_placeholder_models(self):
+        # claude-opus-5 has no confirmed anthropic.com/pricing figure yet, so
+        # the bundled entry is a PLACEHOLDER mirroring the opus-4-5 tier and
+        # stays is_estimated until a real source replaces it. This is the
+        # "we're guessing" bucket, kept out of total_cost/cost_by_agent.
+        self._request(
+            "r5",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "claude-opus-5",
+            container_id="abc1id123456",
+            # claude-opus-5's bundled price is only effective_from 2026-08-01;
+            # the seed's default timestamp (2026-07-26) predates it.
+            ts="2026-08-15T10:00:00+00:00",
+        )
+        self._response(
+            "r5",
+            json.dumps(
+                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+            ).encode(),
+            ts="2026-08-15T10:00:01+00:00",
+        )
+        self.source.commit()
+        self.refresh()
+
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
         total_estimated_value = self.conn.execute(
             charts["total_estimated_value"]["query"],
@@ -541,9 +605,10 @@ class AgentTokenSqlTests(unittest.TestCase):
             ).fetchall()
         }
 
-        expected = round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4)
-        self.assertAlmostEqual(total_estimated_value, expected)
-        self.assertAlmostEqual(by_agent["codex"], expected)
+        self.assertAlmostEqual(total_estimated_value, 5.0 + 25.0)
+        self.assertAlmostEqual(by_agent["claude"], 5.0 + 25.0)
+        # codex is billed as real spend now, so it never lands here.
+        self.assertNotIn("codex", by_agent)
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
@@ -576,14 +641,14 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertAlmostEqual(alpha_claude[real_idx], 5.0 + 25.0)
         self.assertAlmostEqual(alpha_claude[estimated_idx], 0.0)
 
-        # The seeded codex call is flat-rate subscription traffic: it prices
-        # only as an estimate, never as real spend.
+        # The seeded codex call is real spend too: Codex here authenticates
+        # with a metered API key, not a flat-rate plan.
         gamma_codex = rows[("gamma", "codex")]
-        self.assertAlmostEqual(gamma_codex[real_idx], 0.0)
         self.assertAlmostEqual(
-            gamma_codex[estimated_idx],
+            gamma_codex[real_idx],
             round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4),
         )
+        self.assertAlmostEqual(gamma_codex[estimated_idx], 0.0)
 
     def test_recent_calls_includes_cost_and_estimated_flag(self):
         self._request(
@@ -600,6 +665,26 @@ class AgentTokenSqlTests(unittest.TestCase):
                 {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
             ).encode(),
         )
+        # claude-opus-5 is an unverified PLACEHOLDER price, so this row must
+        # still surface is_estimated = 1 even though most calls now don't.
+        self._request(
+            "r6",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "claude-opus-5",
+            container_id="abc1id123456",
+            # claude-opus-5's bundled price is only effective_from 2026-08-01;
+            # the seed's default timestamp (2026-07-26) predates it.
+            ts="2026-08-15T10:00:00+00:00",
+        )
+        self._response(
+            "r6",
+            json.dumps(
+                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+            ).encode(),
+            ts="2026-08-15T10:00:01+00:00",
+        )
         self.source.commit()
         self.refresh()
 
@@ -615,7 +700,9 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertAlmostEqual(rows["claude-opus-4-5"][cost_idx], 5.0 + 25.0)
         self.assertEqual(rows["claude-opus-4-5"][estimated_idx], 0)
-        self.assertEqual(rows["c"][estimated_idx], 1)
+        # codex is billed as real spend now (metered API key, not a plan).
+        self.assertEqual(rows["c"][estimated_idx], 0)
+        self.assertEqual(rows["claude-opus-5"][estimated_idx], 1)
 
     def test_cache_write_card_sums_cache_creation_tokens(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
@@ -1033,7 +1120,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.addCleanup(conn.close)
         columns = [row[1] for row in conn.execute("PRAGMA table_info(token_usage)")]
         self.assertIn("response_id", columns)
-        for col in ("container_id", "container_name", "workspace", "workspace_name"):
+        for col in ("container_id", "container_name", "profile", "workspace", "workspace_name"):
             self.assertIn(col, columns)
         pricing_columns = [row[1] for row in conn.execute("PRAGMA table_info(model_pricing)")]
         for col in ("effective_from", "is_estimated"):
@@ -1447,8 +1534,8 @@ class PricingTests(unittest.TestCase):
         timestamp="2026-08-30T00:00:00+00:00",
     ):
         # Other columns (response_id, reasoning_tokens, container_id,
-        # container_name, workspace, workspace_name, ingested_at) are left to
-        # their table defaults; none of these tests exercise them.
+        # container_name, profile, workspace, workspace_name, ingested_at) are
+        # left to their table defaults; none of these tests exercise them.
         self.conn.execute(
             "INSERT INTO token_usage (source, row_id, request_id, timestamp, agent, "
             "provider, model, host, input_tokens, output_tokens, cached_tokens, "
@@ -1731,14 +1818,15 @@ class PricingTests(unittest.TestCase):
         }
         self.assertIn("openai-codex", providers)
         self.assertIn("github-copilot", providers)
-        # Subscription catch-alls carry the metered-equivalent rate, not $0,
-        # and are flagged is_estimated since it's not real per-token spend.
+        # Codex/Copilot here authenticate with a metered API key, not a
+        # flat-rate plan, so the catch-all carries a real per-token rate and
+        # is not flagged is_estimated.
         catch_all = self.conn.execute(
             "SELECT input_price_per_1m, is_estimated FROM model_pricing "
             "WHERE provider = 'openai-codex' AND model = ''",
         ).fetchone()
         self.assertGreater(catch_all[0], 0)
-        self.assertEqual(catch_all[1], 1)
+        self.assertEqual(catch_all[1], 0)
 
 
 class AgentTokenDashboardMetadataTests(unittest.TestCase):
