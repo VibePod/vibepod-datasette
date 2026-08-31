@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - exercised via the container image
 # tables/views and rebuilds them, because old rows/columns cannot be upgraded
 # in place. model_pricing is cheap to drop: it holds no captured data, only a
 # full reload of pricing/model_prices.json on the next refresh.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -75,21 +75,26 @@ CREATE TABLE IF NOT EXISTS token_usage (
 -- Snapshot of logs.db sessions, refilled on every refresh. Workspace
 -- resolution matches a call to the session of its container; Docker bundle
 -- ids are reused for container names, so the id (12-char prefix) is the
--- reliable key, the name only a fallback.
+-- reliable key, the name only a fallback. profile is carried along as the
+-- fallback source for calls the proxy captured without one.
 CREATE TABLE IF NOT EXISTS session_windows (
     container_id12   TEXT NOT NULL,
     container_name   TEXT NOT NULL,
     workspace        TEXT NOT NULL,
     workspace_name   TEXT NOT NULL,
+    profile          TEXT NOT NULL DEFAULT '',
     started_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_windows_id ON session_windows(container_id12);
 CREATE INDEX IF NOT EXISTS idx_session_windows_name ON session_windows(container_name, started_at);
 
--- Rows whose workspace has not been resolved yet; the partial index keeps
--- rescans cheap. Unresolvable rows age out after GRACE_SECONDS below and are
--- decided 'unknown' once, so they are not retried on every refresh.
+-- Rows whose workspace or profile has not been resolved yet; the partial
+-- indexes keep rescans cheap. Unresolvable rows age out after GRACE_SECONDS
+-- below and are decided 'unknown' once, so they are not retried on every
+-- refresh.
 CREATE INDEX IF NOT EXISTS idx_token_usage_pending ON token_usage(workspace) WHERE workspace = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_pending_profile ON token_usage(profile)
+    WHERE profile = '';
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage(agent);
@@ -110,9 +115,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
 --      response id is present, keep a single row per (request_id, response_id)
 --      -- the one reporting the most tokens, since a later snapshot may be the
 --      complete one.
--- Explicit column list so the workspace columns can be normalized: rows
--- whose resolution is still pending would otherwise surface an empty label,
--- which is exactly the bucket the 'unknown' fallback avoids.
+-- Explicit column list so the workspace and profile columns can be
+-- normalized: rows whose resolution is still pending would otherwise surface
+-- an empty label, which is exactly the bucket the 'unknown' fallback avoids.
 CREATE VIEW IF NOT EXISTS agent_token_usage AS
 SELECT
     t.source,
@@ -132,7 +137,10 @@ SELECT
     t.has_usage,
     t.container_id,
     t.container_name,
-    t.profile,
+    CASE
+        WHEN t.profile = '' THEN 'unknown'
+        ELSE t.profile
+    END AS profile,
     CASE
         WHEN t.workspace = '' THEN 'unknown'
         ELSE t.workspace
@@ -255,9 +263,12 @@ LEFT JOIN model_pricing mp
    AND mp.effective_from = m.priced_effective_from;
 """
 
+# {profile} is filled in by profile_expr() below: a proxy.db written before the
+# proxy logged profiles has no such column, and a hard reference would fail the
+# whole ingest instead of leaving the profile empty for those rows.
 HTTP_SQL = """
 SELECT resp.id, r.id, COALESCE(r.timestamp, resp.timestamp), r.source_container_name,
-       r.source_container_id, r.profile, r.host, r.body, resp.body
+       r.source_container_id, {profile}, r.host, r.body, resp.body
 FROM http_responses resp
 JOIN http_requests r ON r.id = resp.request_id
 WHERE resp.id > ? AND r.method = 'POST' AND resp.body IS NOT NULL AND length(resp.body) > 0
@@ -267,7 +278,7 @@ LIMIT ?
 
 WS_SQL = """
 SELECT ws.id, r.id, ws.timestamp, r.source_container_name, r.source_container_id,
-       r.profile, r.host, r.body, ws.content
+       {profile}, r.host, r.body, ws.content
 FROM websocket_messages ws
 JOIN http_requests r ON r.id = ws.request_id
 WHERE ws.id > ?
@@ -346,6 +357,22 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def profile_expr(conn: sqlite3.Connection, table: str, alias: str) -> str:
+    """SQL for the profile of `table`, or a constant when the column is absent.
+
+    Both sources grew their profile column after this cache shipped -- the
+    proxy on http_requests, the CLI on sessions -- so either shape can be in
+    the field. A missing column has to cost the profile of the rows it would
+    have named, never the whole refresh.
+    """
+    return f"{alias}.profile" if has_column(conn, table, "profile") else "''"
+
+
 def watermark(cache: sqlite3.Connection, source: str) -> int:
     row = cache.execute(
         "SELECT last_row_id FROM sync_state WHERE source = ?",
@@ -401,6 +428,8 @@ def _row_values(
         # matches either length to the session's container_id.
         (container_id or "")[:12],
         container or "",
+        # The proxy records the profile on the request itself; when it did not,
+        # the resolution pass fills it in from the container's session.
         profile or "",
         # Workspace is resolved in the dedicated pass after ingest, because the
         # session row may only appear in logs.db after the call was captured.
@@ -520,7 +549,7 @@ def _parse_ts(value: str) -> datetime | None:
     return parsed
 
 
-def resolve_workspace(container_id12: str, container_name: str, ts, windows):
+def resolve_session(container_id12: str, container_name: str, ts, windows):
     """Match a call to its container's session: exact id first, name fallback.
 
     The id match needs no time logic, because Docker container ids are never
@@ -529,14 +558,15 @@ def resolve_workspace(container_id12: str, container_name: str, ts, windows):
     predates the id column); there the newest session that started before the
     call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
     after session end from the same container still inherits that container's
-    workspace. Returns (workspace, workspace_name, resolution_path) or None.
+    workspace and profile. Returns (workspace, workspace_name, profile,
+    resolution_path) or None.
     """
-    for id12, _name, workspace, workspace_name, _started_at in windows:
+    for id12, _name, workspace, workspace_name, profile, _started_at in windows:
         if id12 and id12 == container_id12:
-            return (workspace, workspace_name, "by_id")
+            return (workspace, workspace_name, profile, "by_id")
     best = None  # newest session started before the call
     best_started = None
-    for _id12, name, workspace, workspace_name, started_at in windows:
+    for _id12, name, workspace, workspace_name, profile, started_at in windows:
         if name != container_name:
             continue
         started = _parse_ts(started_at)
@@ -545,20 +575,26 @@ def resolve_workspace(container_id12: str, container_name: str, ts, windows):
         if ts is not None and started > ts:
             continue
         if best_started is None or started > best_started:
-            best, best_started = (workspace, workspace_name), started
+            best, best_started = (workspace, workspace_name, profile), started
     if best is None:
         return None
-    return (best[0], best[1], "by_name")
+    return (*best, "by_name")
 
 
-def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
+def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
     """Refresh session_windows, then resolve every pending token_usage row.
 
-    Rows that fail resolution AND were ingested longer ago than the grace
-    period are decided 'unknown' once, so they do not get rescanned on every
-    refresh. Recently ingested rows stay pending so a session row arriving in
-    logs.db later still resolves them.
-    Returns resolution counts for the log line.
+    A row is pending while its workspace or its profile is still empty. Rows
+    that fail resolution AND were ingested longer ago than the grace period are
+    decided 'unknown' once, so they do not get rescanned on every refresh.
+    Recently ingested rows stay pending so a session row arriving in logs.db
+    later still resolves them.
+
+    Workspace is only ever known from the session. Profile is normally recorded
+    on the request by the proxy, and that value always wins -- the session is
+    the fallback for calls captured before the proxy logged profiles, or by a
+    proxy that does not.
+    Returns {"workspace": counts, "profile": counts} for the log lines.
     """
     if not logs_path.exists() or not table_exists(cache, "session_windows"):
         return None
@@ -567,7 +603,8 @@ def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRA
         if not table_exists(logs, "sessions"):
             return None
         rows = logs.execute(
-            "SELECT container_id, container_name, workspace, started_at FROM sessions",
+            "SELECT container_id, container_name, workspace, "
+            f"{profile_expr(logs, 'sessions', 'sessions')}, started_at FROM sessions",
         ).fetchall()
     finally:
         logs.close()
@@ -578,57 +615,76 @@ def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRA
             row[2] or "",
             Path(row[2] or "").name or row[2] or "",
             row[3] or "",
+            row[4] or "",
         )
         for row in rows
     )
     cache.execute("DELETE FROM session_windows")
     cache.executemany(
         "INSERT INTO session_windows (container_id12, container_name, workspace, "
-        "workspace_name, started_at) VALUES (?, ?, ?, ?, ?)",
+        "workspace_name, profile, started_at) VALUES (?, ?, ?, ?, ?, ?)",
         windows,
     )
     pending = cache.execute(
-        "SELECT source, row_id, container_id, container_name, timestamp, ingested_at "
-        "FROM token_usage WHERE workspace = ''",
+        "SELECT source, row_id, container_id, container_name, timestamp, ingested_at, "
+        "workspace, profile FROM token_usage WHERE workspace = '' OR profile = ''",
     ).fetchall()
     deadline = datetime.now(UTC) - timedelta(seconds=grace_seconds)
-    updates = []
+    workspace_updates = []
+    profile_updates = []
     counts = {"by_id": 0, "by_name": 0, "unknown": 0, "pending": 0}
-    for source, row_id, id12, name, ts, ingested_at in pending:
-        resolved = resolve_workspace(id12, name, _parse_ts(ts), windows)
-        workspace = None
-        if resolved is not None:
-            (workspace, workspace_name, path) = resolved
-            counts[path] += 1
-        else:
-            # An unparseable ingest stamp must still age out, otherwise the row
-            # is rescanned on every refresh forever.
-            ingested = _parse_ts(ingested_at)
-            if ingested is None or ingested <= deadline:
-                workspace = "unknown"
-                workspace_name = "unknown"
+    profile_counts = {"by_session": 0, "unknown": 0, "pending": 0}
+    for source, row_id, id12, name, ts, ingested_at, workspace_now, profile_now in pending:
+        resolved = resolve_session(id12, name, _parse_ts(ts), windows)
+        # An unparseable ingest stamp must still age out, otherwise the row is
+        # rescanned on every refresh forever.
+        ingested = _parse_ts(ingested_at)
+        aged_out = ingested is None or ingested <= deadline
+        if workspace_now == "":
+            if resolved is not None:
+                (workspace, workspace_name, _profile, path) = resolved
+                counts[path] += 1
+                workspace_updates.append((workspace, workspace_name, source, row_id))
+            elif aged_out:
                 counts["unknown"] += 1
+                workspace_updates.append(("unknown", "unknown", source, row_id))
             else:
                 counts["pending"] += 1
-        if workspace is not None:
-            updates.append((workspace, workspace_name, source, row_id))
-    if updates:
+        if profile_now == "":
+            # A session without a profile resolves nothing here: it ages out to
+            # 'unknown' like a call with no session at all.
+            session_profile = resolved[2] if resolved is not None else ""
+            if session_profile:
+                profile_counts["by_session"] += 1
+                profile_updates.append((session_profile, source, row_id))
+            elif aged_out:
+                profile_counts["unknown"] += 1
+                profile_updates.append(("unknown", source, row_id))
+            else:
+                profile_counts["pending"] += 1
+    if workspace_updates:
         cache.executemany(
             "UPDATE token_usage SET workspace = ?, workspace_name = ? "
             "WHERE source = ? AND row_id = ?",
-            updates,
+            workspace_updates,
+        )
+    if profile_updates:
+        cache.executemany(
+            "UPDATE token_usage SET profile = ? WHERE source = ? AND row_id = ?",
+            profile_updates,
         )
     cache.commit()
-    return counts
+    return {"workspace": counts, "profile": profile_counts}
 
 
-def _log_workspace_counts(counts) -> None:
+def _log_resolution_counts(counts) -> None:
     if counts is None:
         return
-    print(
-        "workspace resolution: " + ", ".join(f"{k}={v}" for k, v in counts.items()),
-        flush=True,
-    )
+    for label, bucket in (("workspace", counts["workspace"]), ("profile", counts["profile"])):
+        print(
+            f"{label} resolution: " + ", ".join(f"{k}={v}" for k, v in bucket.items()),
+            flush=True,
+        )
 
 
 def build(
@@ -652,26 +708,35 @@ def build(
 
     if not proxy_path.exists():
         if logs_path is not None:
-            _log_workspace_counts(sync_workspace(logs_path, cache))
+            _log_resolution_counts(sync_sessions(logs_path, cache))
         cache.close()
         return {"http": 0, "ws": 0}
 
     src = open_source(proxy_path)
     counts = {"http": 0, "ws": 0}
     try:
+        # Both queries read the profile off http_requests, so they share it.
+        profile = profile_expr(src, "http_requests", "r")
         if table_exists(src, "http_responses") and table_exists(src, "http_requests"):
             counts["http"] = sync_source(
                 "http",
-                HTTP_SQL,
+                HTTP_SQL.format(profile=profile),
                 src,
                 cache,
                 batch_size,
                 max_rows,
             )
         if table_exists(src, "websocket_messages"):
-            counts["ws"] = sync_source("ws", WS_SQL, src, cache, batch_size, max_rows)
+            counts["ws"] = sync_source(
+                "ws",
+                WS_SQL.format(profile=profile),
+                src,
+                cache,
+                batch_size,
+                max_rows,
+            )
         if logs_path is not None:
-            _log_workspace_counts(sync_workspace(logs_path, cache))
+            _log_resolution_counts(sync_sessions(logs_path, cache))
     finally:
         src.close()
         cache.close()
@@ -691,7 +756,7 @@ def main() -> int:
     parser.add_argument(
         "--logs-db",
         default=os.environ.get("LOGS_DB_PATH", "/data/logs.db"),
-        help="session log database used to resolve workspaces",
+        help="session log database used to resolve workspaces and profiles",
     )
     parser.add_argument(
         "--pricing-file",

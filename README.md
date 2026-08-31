@@ -11,7 +11,7 @@ Datasette container for browsing both VibePod SQLite databases:
 - agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
 - dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
 - `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
-  attributed to the workspace each call came from via `logs.db`
+  attributed to the workspace and the proxy profile each call came from via `logs.db`
 - token usage is priced from a bundled pricing dataset (`pricing/model_prices.json`), exposed
   alongside usage as cost cards/tables on the `agent-tokens` dashboard
 
@@ -66,8 +66,10 @@ It includes:
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
 - tokens by workspace, split into input vs output series, plus a count of active workspaces
+- tokens by profile, split into input vs output series, plus a count of active profiles
 - tokens by agent and model table, including cached, cache-write, and cost columns
 - tokens by workspace and agent table
+- tokens and cost by profile and agent table
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
@@ -79,6 +81,7 @@ Available dashboard filters:
   hourly for `24h`, and daily beyond that)
 - agent (derived from `source_container_name`, e.g. `vibepod-tau-...` -> `tau`)
 - workspace (the directory the agent ran in, resolved from `logs.db`; see below)
+- profile (the proxy filter profile the call ran under; see below)
 - provider (`anthropic`, `openai-codex`, `google`, `groq`, ... derived from the request host)
 - host
 - table row limit
@@ -121,6 +124,36 @@ pending=…`), and two queries make the attribution auditable:
 sums, and `workspace_resolution` for the per-container breakdown of resolved and still
 pending rows. A dashboard dominated by `unknown` means the container link is not working —
 which is visible as a number rather than as silently misattributed tokens.
+
+### How calls are attributed to a profile
+
+A profile is the proxy filter profile a container runs under (`vibepod profile list`), which
+decides which hosts that agent may reach. Attributing tokens to it answers what a given
+policy actually costs, and pairs with the filter panels on the HTTP Requests dashboard that
+show what it blocked.
+
+Unlike the workspace, the profile has two possible sources, and they are tried in this order:
+
+- **The request row wins.** The proxy writes `http_requests.profile` when it applies the
+  policy, so that value is the profile the call was actually filtered under, and the cache
+  stores it verbatim at ingest.
+- **The session is the fallback**, resolved from `sessions.profile` through the same
+  container match the workspace uses (id first, name second). It covers calls the proxy
+  captured without a profile.
+
+Everything else mirrors the workspace contract: an unresolved profile is retried on every
+refresh, decided `unknown` once the 15-minute grace window closes, and shown as `unknown`
+rather than as a blank label, so per-profile totals still add up to the overall total. The
+refresh logs `profile resolution: by_session=…, unknown=…, pending=…` next to the workspace
+line, and `profile_token_totals` (`/-/queries/usage/profile_token_totals`) and
+`profile_resolution` make the attribution auditable the same way.
+
+Both source columns are recent, so the cache tolerates databases written without them: a
+`proxy.db` whose `http_requests` has no `profile` column still ingests (those rows fall back
+to the session), and a `logs.db` whose `sessions` has none simply resolves no profile. The
+profile panels on the **HTTP Requests** and **Agent Sessions** dashboards read those source
+columns directly, so they need a proxy and a CLI new enough to write them; the token
+dashboards do not, because they read the cache.
 
 ### Why there is a usage cache
 
@@ -272,6 +305,10 @@ It includes:
 - status code distribution
 - top hosts by traffic/errors/latency
 - request/error trend chart (hourly or daily buckets)
+- filter visibility: the mode last seen, how many requests were blocked, blocked hosts
+  (allow-list candidates) and hosts that passed with the filter active (deny-list candidates)
+- filter decisions by profile: blocked vs passed per proxy filter profile, so a block can be
+  traced back to the policy that caused it
 - filterable/sortable recent-request table
 
 Available dashboard filters/sorting:
@@ -283,6 +320,10 @@ Available dashboard filters/sorting:
 - status-class filter (`2xx`, `3xx`, `4xx`, `5xx`, `error`)
 - request table sort (time/status/duration/error-priority)
 - host ranking sort (volume/error-count/latency)
+
+The profile columns on those panels come from `http_requests.profile`, written by the proxy
+when it applies a policy; against a proxy that does not record it yet, only those panels
+report an error, the rest of the dashboard is unaffected.
 
 If the dashboard reports that `http_requests` is missing, start VibePod traffic capture first (the proxy DB schema is created by `vibepod-proxy` once traffic is recorded).
 
@@ -328,7 +369,8 @@ It includes:
 - top workspaces by session and message volume
 - sessions-over-time trend (multi-series per agent, daily or hourly buckets)
 - sessions by hour-of-day distribution (work-habits view)
-- recent sessions drill-down table (per-session message counts)
+- recent sessions drill-down table (per-session message counts and the profile the session
+  ran under, from `sessions.profile`)
 
 Available dashboard filters:
 

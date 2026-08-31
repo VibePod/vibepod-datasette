@@ -194,6 +194,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         "provider": "all",
         "host": "all",
         "workspace": "all",
+        "profile": "all",
         "limit": 200,
         "request_limit": 100,
     }
@@ -214,20 +215,30 @@ class AgentTokenSqlTests(unittest.TestCase):
     -- Mirrors session_logger.py: the session fixture the resolver joins against.
     CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT, image TEXT,
         workspace TEXT, container_id TEXT, container_name TEXT, started_at TEXT,
-        ended_at TEXT, exit_reason TEXT, vibepod_version TEXT);
+        ended_at TEXT, exit_reason TEXT, vibepod_version TEXT,
+        profile TEXT NOT NULL DEFAULT 'default');
     """
 
-    def _session(self, container_id, container_name, workspace, started_at, session_id=None):
+    def _session(
+        self,
+        container_id,
+        container_name,
+        workspace,
+        started_at,
+        session_id=None,
+        profile="default",
+    ):
         self.logs.execute(
             "INSERT INTO sessions (id, agent, image, workspace, container_id, "
-            "container_name, started_at, ended_at, exit_reason, vibepod_version) "
-            "VALUES (?, 'agent', 'image', ?, ?, ?, ?, NULL, NULL, '')",
+            "container_name, started_at, ended_at, exit_reason, vibepod_version, profile) "
+            "VALUES (?, 'agent', 'image', ?, ?, ?, ?, NULL, NULL, '', ?)",
             (
                 session_id or f"sess-{container_id}",
                 workspace,
                 container_id,
                 container_name,
                 started_at,
+                profile,
             ),
         )
         self.logs.commit()
@@ -400,6 +411,13 @@ class AgentTokenSqlTests(unittest.TestCase):
             (request_id,),
         ).fetchone()[0]
 
+    def _stored_profile(self, request_id):
+        """The raw, un-normalized profile of a row ('' while still pending)."""
+        return self.conn.execute(
+            "SELECT profile FROM token_usage WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0]
+
     def test_totals_sum_every_agent_once(self):
         sql = self.metadata["databases"]["usage"]["queries"]["agent_token_totals"]["sql"]
 
@@ -460,13 +478,25 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertEqual(profile, "work")
 
-    def test_profile_defaults_to_empty_string_when_unresolved(self):
-        # r1 was seeded without a profile (unmapped source IP, e.g.).
+    def test_profile_without_a_proxy_value_comes_from_the_session(self):
+        # r1 was seeded without a profile (unmapped source IP, e.g.), so the
+        # session of its container is what names the profile.
         profile = self.conn.execute(
             "SELECT profile FROM agent_token_usage WHERE request_id = 'r1'",
         ).fetchone()[0]
 
-        self.assertEqual(profile, "")
+        self.assertEqual(profile, "default")
+
+    def test_profile_with_no_source_at_all_reads_as_unknown(self):
+        # The copilot seed has neither a proxy profile nor a session: the row
+        # stays pending in the table but must never surface an empty label.
+        raw = self._stored_profile("r3")
+        shown = self.conn.execute(
+            "SELECT profile FROM agent_token_usage WHERE request_id = 'r3'",
+        ).fetchone()[0]
+
+        self.assertEqual(raw, "")
+        self.assertEqual(shown, "unknown")
 
     def test_coverage_lists_calls_without_usage(self):
         sql = self.metadata["databases"]["usage"]["queries"]["agent_token_coverage"]["sql"]
@@ -516,13 +546,13 @@ class AgentTokenSqlTests(unittest.TestCase):
                 continue
             if name in ("total_cost", "total_estimated_value"):
                 continue
+            counted = {
+                "calls_with_usage": " calls",
+                "active_workspaces": " workspaces",
+                "active_profiles": " profiles",
+            }
             with self.subTest(chart=name):
-                expected = (
-                    " calls"
-                    if name == "calls_with_usage"
-                    else (" workspaces" if name == "active_workspaces" else " tok")
-                )
-                self.assertEqual(chart["display"]["suffix"], expected)
+                self.assertEqual(chart["display"]["suffix"], counted.get(name, " tok"))
 
     def test_cost_metric_uses_a_dollar_prefix(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
@@ -1377,12 +1407,12 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertEqual(self._stored_workspace("grc"), "")
 
-        counts = build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
+        counts = build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
         self.assertEqual(self._stored_workspace("grc"), "unknown")
-        self.assertGreaterEqual(counts["unknown"], 1)
+        self.assertGreaterEqual(counts["workspace"]["unknown"], 1)
         # Decided once: a later pass no longer sees the row at all.
-        counts = build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
-        self.assertEqual(counts["unknown"], 0)
+        counts = build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
+        self.assertEqual(counts["workspace"]["unknown"], 0)
         self.assertEqual(self._stored_workspace("grc"), "unknown")
 
     def test_workspace_chart_sums_workspaces_sharing_a_basename(self):
@@ -1446,23 +1476,30 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertNotIn("", [v for pair in rows for v in pair])
 
-    def test_resolve_workspace_unit(self):
-        alpha = ("abc1id123456", "vibepod-claude-abc1", "/hs/alpha", "alpha")
+    def test_resolve_session_unit(self):
+        alpha = ("abc1id123456", "vibepod-claude-abc1", "/hs/alpha", "alpha", "work")
         windows = [
             (*alpha, "2026-07-25T10:00:00+00:00"),
-            ("xbc1idzzzzzz", "vibepod-clone", "/hs/clone", "clone", "2026-07-25T10:00:00+00:00"),
+            (
+                "xbc1idzzzzzz",
+                "vibepod-clone",
+                "/hs/clone",
+                "clone",
+                "personal",
+                "2026-07-25T10:00:00+00:00",
+            ),
         ]
         ts = build_usage_cache._parse_ts("2026-07-26T10:00:00+00:00")
-        by_id = build_usage_cache.resolve_workspace("abc1id123456", "vibepod-other", ts, windows)
-        self.assertEqual(by_id, ("/hs/alpha", "alpha", "by_id"))
-        by_name = build_usage_cache.resolve_workspace("", "vibepod-clone", ts, windows)
-        self.assertEqual(by_name, ("/hs/clone", "clone", "by_name"))
+        by_id = build_usage_cache.resolve_session("abc1id123456", "vibepod-other", ts, windows)
+        self.assertEqual(by_id, ("/hs/alpha", "alpha", "work", "by_id"))
+        by_name = build_usage_cache.resolve_session("", "vibepod-clone", ts, windows)
+        self.assertEqual(by_name, ("/hs/clone", "clone", "personal", "by_name"))
         # An id that matches no session still falls back to the name.
-        stale_id = build_usage_cache.resolve_workspace("zzz1idxxxxxx", "vibepod-clone", ts, windows)
-        self.assertEqual(stale_id, ("/hs/clone", "clone", "by_name"))
-        self.assertIsNone(build_usage_cache.resolve_workspace("", "vibepod-nope", ts, windows))
+        stale_id = build_usage_cache.resolve_session("zzz1idxxxxxx", "vibepod-clone", ts, windows)
+        self.assertEqual(stale_id, ("/hs/clone", "clone", "personal", "by_name"))
+        self.assertIsNone(build_usage_cache.resolve_session("", "vibepod-nope", ts, windows))
         self.assertIsNone(
-            build_usage_cache.resolve_workspace("abc1idxxxxxx", "vibepod-nope", ts, windows),
+            build_usage_cache.resolve_session("abc1idxxxxxx", "vibepod-nope", ts, windows),
         )
 
     def test_resolution_beats_the_grace_decision(self):
@@ -1483,11 +1520,176 @@ class AgentTokenSqlTests(unittest.TestCase):
         self._session("grz1id000002", "vibepod-grz-1", "/elsewhere/resolved", started)
         self.source.commit()
         self.refresh()
-        build_usage_cache.sync_workspace(self.logs_path, self.conn, grace_seconds=0)
+        build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
 
         workspaces = self._workspace(agent="grz")
 
         self.assertIn("resolved", workspaces)
+
+    def _profiles(self):
+        sql = self.metadata["databases"]["usage"]["queries"]["profile_token_totals"]["sql"]
+        return {row[0]: row for row in self.conn.execute(sql, self.PARAMS).fetchall()}
+
+    def test_profile_recorded_by_the_proxy_wins_over_the_session(self):
+        # The request row is the profile the proxy actually filtered under; a
+        # session that later reports another one must not overwrite it.
+        self._session(
+            "prf1id000001",
+            "vibepod-prf-1",
+            "/home/g/projects/prf",
+            "2026-07-25T10:00:00+00:00",
+            profile="personal",
+        )
+        self._request(
+            "pr1",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-prf-1",
+            "l3",
+            container_id="prf1id000001",
+            profile="work",
+        )
+        self._response("pr1", json.dumps({"usage": {"prompt_tokens": 5}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_profile("pr1"), "work")
+
+    def test_profile_falls_back_to_the_session_when_the_proxy_logged_none(self):
+        self._session(
+            "prf2id000002",
+            "vibepod-prf-2",
+            "/home/g/projects/prf2",
+            "2026-07-25T10:00:00+00:00",
+            profile="personal",
+        )
+        self._request(
+            "pr2",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-prf-2",
+            "l3",
+            container_id="prf2id000002",
+        )
+        self._response("pr2", json.dumps({"usage": {"prompt_tokens": 6}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_profile("pr2"), "personal")
+
+    def test_profile_ages_out_to_unknown_without_a_session(self):
+        # Same grace contract as the workspace: pending until the window
+        # closes, then decided once so it is not rescanned forever.
+        self._request("pr3", "api.groq.com", "/v1/chat", "vibepod-prf-3", "l3")
+        self._response("pr3", json.dumps({"usage": {"prompt_tokens": 7}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_profile("pr3"), "")
+
+        counts = build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
+        self.assertEqual(self._stored_profile("pr3"), "unknown")
+        self.assertGreaterEqual(counts["profile"]["unknown"], 1)
+        counts = build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
+        self.assertEqual(counts["profile"]["unknown"], 0)
+
+    def test_profile_resolves_on_a_later_refresh_like_the_workspace(self):
+        # The session row can reach logs.db after the call was parsed; the
+        # profile must be filled in on the next pass instead of staying empty.
+        self._request(
+            "pr4",
+            "api.groq.com",
+            "/v1/chat",
+            "vibepod-prf-4",
+            "l3",
+            container_id="prf4id000004",
+        )
+        self._response("pr4", json.dumps({"usage": {"prompt_tokens": 8}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_profile("pr4"), "")
+
+        self._session(
+            "prf4id000004",
+            "vibepod-prf-4",
+            "/home/g/projects/prf4",
+            "2026-07-25T10:00:00+00:00",
+            profile="late",
+        )
+        self.refresh()
+
+        self.assertEqual(self._stored_profile("pr4"), "late")
+
+    def test_empty_profile_labels_are_never_exposed(self):
+        rows = self.conn.execute("SELECT DISTINCT profile FROM agent_token_usage").fetchall()
+
+        self.assertNotIn("", [row[0] for row in rows])
+
+    def test_profile_totals_split_usage_per_profile(self):
+        for rid, profile, tokens in (("pa", "work", 10), ("pb", "personal", 25)):
+            self._request(
+                rid,
+                "api.groq.com",
+                "/v1/chat",
+                f"vibepod-tot-{rid}",
+                "l3",
+                profile=profile,
+            )
+            self._response(rid, json.dumps({"usage": {"prompt_tokens": tokens}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        totals = self._profiles()
+
+        self.assertEqual(totals["work"][2], 10)
+        self.assertEqual(totals["personal"][2], 25)
+
+    def test_profile_chart_sums_input_and_output_per_profile(self):
+        for rid, tokens in (("pc1", 10), ("pc2", 20)):
+            self._request(
+                rid,
+                "api.groq.com",
+                "/v1/chat",
+                f"vibepod-chart-{rid}",
+                "l3",
+                profile="shared",
+            )
+            self._response(rid, json.dumps({"usage": {"prompt_tokens": tokens}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        sql = charts["tokens_by_profile"]["query"]
+        rows = {(row[0], row[1]): row for row in self.conn.execute(sql, self.PARAMS).fetchall()}
+
+        self.assertEqual(rows[("shared", "input")][2], 30)
+        self.assertEqual(rows[("shared", "input")][3], 2)
+
+    def test_profile_filter_narrows_the_charts(self):
+        self._request("pf1", "api.groq.com", "/v1/chat", "vibepod-flt-1", "l3", profile="work")
+        self._response("pf1", json.dumps({"usage": {"prompt_tokens": 40}}).encode())
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        params = dict(self.PARAMS, profile="work")
+        total = self.conn.execute(charts["total_tokens"]["query"], params).fetchone()[0]
+
+        self.assertEqual(total, 40)
+
+    def test_every_chart_query_references_profile_filter(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        for name, chart in charts.items():
+            with self.subTest(chart=name):
+                self.assertIn(":profile", chart["query"])
+
+    def test_profile_resolution_diagnostic_buckets_pending_rows(self):
+        sql = self.metadata["databases"]["usage"]["queries"]["profile_resolution"]["sql"]
+
+        rows = self.conn.execute(sql).fetchall()
+
+        self.assertIn("abc1id123456", {row[0] for row in rows})
 
     def test_agent_name_parsing(self):
         self.assertEqual(
@@ -1501,6 +1703,215 @@ class AgentTokenSqlTests(unittest.TestCase):
         )
         self.assertEqual(build_usage_cache.agent_from_container(""), "unknown")
         self.assertEqual(build_usage_cache.agent_from_container(None), "unknown")
+
+
+class ProxyAndSessionDashboardSqlTests(unittest.TestCase):
+    """Run the proxy- and logs-backed chart queries against their real schemas.
+
+    Those dashboards read the capture databases directly instead of the usage
+    cache, so a column that only exists in a newer proxy or CLI has to be
+    exercised here or nothing catches a typo in it until the dashboard renders.
+    """
+
+    PROXY_SCHEMA = """
+    CREATE TABLE http_requests (id TEXT PRIMARY KEY, timestamp TEXT, method TEXT,
+        source_container_id TEXT, source_container_name TEXT, scheme TEXT, host TEXT,
+        port INTEGER, path TEXT, query TEXT, url TEXT, headers TEXT, body BLOB,
+        client_ip TEXT, client_port INTEGER, server_ip TEXT, server_port INTEGER,
+        blocked INTEGER NOT NULL DEFAULT 0, filter_mode TEXT, block_reason TEXT,
+        profile TEXT);
+    CREATE TABLE http_responses (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT,
+        timestamp TEXT, status_code INTEGER, headers TEXT, body BLOB, bytes_in INTEGER,
+        bytes_out INTEGER, duration_ms REAL);
+    CREATE TABLE http_errors (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT,
+        timestamp TEXT, error_type TEXT, message TEXT);
+    CREATE TABLE websocket_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT,
+        timestamp TEXT, direction TEXT, type TEXT, content BLOB);
+    """
+
+    LOGS_SCHEMA = """
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT, image TEXT, workspace TEXT,
+        container_id TEXT, container_name TEXT, started_at TEXT, ended_at TEXT,
+        exit_reason TEXT, vibepod_version TEXT, profile TEXT NOT NULL DEFAULT 'default');
+    CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,
+        timestamp TEXT, role TEXT, content TEXT);
+    """
+
+    PROXY_PARAMS = {
+        "time_range": "all",
+        "time_bucket": "auto",
+        "host_query": "",
+        "method": "all",
+        "agent": "all",
+        "status_class": "all",
+        "host_sort": "request_count",
+        "request_sort": "timestamp_desc",
+        "request_limit": 100,
+    }
+
+    LOGS_PARAMS = {
+        "time_range": "all",
+        "time_bucket": "auto",
+        "agent": "all",
+        "workspace": "all",
+        "session_limit": 100,
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+
+        self.proxy = sqlite3.connect(Path(self.tmp.name) / "proxy.db")
+        self.addCleanup(self.proxy.close)
+        self.proxy.executescript(self.PROXY_SCHEMA)
+        # One blocked and one passed request, on different profiles.
+        self.proxy.executemany(
+            "INSERT INTO http_requests (id, timestamp, method, source_container_name, "
+            "source_container_id, host, path, blocked, filter_mode, block_reason, profile) "
+            "VALUES (?, '2026-07-26T10:00:00+00:00', 'POST', 'vibepod-tau-1', 'c1', ?, "
+            "'/v1/chat', ?, ?, ?, ?)",
+            [
+                ("blk", "evil.example", 1, "allow", "allow-miss", "work"),
+                ("ok", "api.groq.com", 0, "allow", None, "personal"),
+                ("noprof", "api.groq.com", 0, "allow", None, None),
+            ],
+        )
+        self.proxy.execute(
+            "INSERT INTO http_responses (request_id, timestamp, status_code, duration_ms) "
+            "VALUES ('ok', '2026-07-26T10:00:01+00:00', 200, 12.5)",
+        )
+        self.proxy.commit()
+
+        self.logs = sqlite3.connect(Path(self.tmp.name) / "logs.db")
+        self.addCleanup(self.logs.close)
+        self.logs.executescript(self.LOGS_SCHEMA)
+        self.logs.execute(
+            "INSERT INTO sessions (id, agent, image, workspace, container_id, container_name, "
+            "started_at, profile) VALUES ('s1', 'tau', 'img', '/ws/a', 'c1', 'vibepod-tau-1', "
+            "'2026-07-26T09:00:00+00:00', 'work')",
+        )
+        self.logs.commit()
+
+    def test_every_http_requests_chart_query_runs(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["http-requests"]["charts"]
+
+        for name, chart in charts.items():
+            with self.subTest(chart=name):
+                self.proxy.execute(chart["query"], self.PROXY_PARAMS).fetchall()
+
+    def test_every_agent_sessions_chart_query_runs(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-sessions"]["charts"]
+
+        for name, chart in charts.items():
+            with self.subTest(chart=name):
+                self.logs.execute(chart["query"], self.LOGS_PARAMS).fetchall()
+
+    def test_filter_decisions_are_counted_per_profile(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["http-requests"]["charts"]
+        sql = charts["decisions_by_profile"]["query"]
+
+        rows = {(row[0], row[1]): row[2] for row in self.proxy.execute(sql, self.PROXY_PARAMS)}
+
+        self.assertEqual(rows[("work", "blocked")], 1)
+        self.assertEqual(rows[("personal", "passed")], 1)
+        # A request the proxy captured without a profile must stay visible.
+        self.assertEqual(rows[("unknown", "passed")], 1)
+
+
+class LegacySourceSchemaTests(unittest.TestCase):
+    """Databases written before profiles were logged must still be ingestible.
+
+    The proxy and the CLI grew their profile columns after this cache did, so
+    both shapes are in the field; a missing column has to cost the profile of
+    those rows, never the whole refresh.
+    """
+
+    PROXY_SCHEMA = """
+    CREATE TABLE http_requests (id TEXT PRIMARY KEY, timestamp TEXT, method TEXT,
+        source_container_id TEXT, source_container_name TEXT, scheme TEXT,
+        host TEXT, port INTEGER, path TEXT, query TEXT, url TEXT, headers TEXT,
+        body BLOB, client_ip TEXT, client_port INTEGER, server_ip TEXT,
+        server_port INTEGER);
+    CREATE TABLE http_responses (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT,
+        timestamp TEXT, status_code INTEGER, headers TEXT, body BLOB, bytes_in INTEGER,
+        bytes_out INTEGER, duration_ms REAL);
+    """
+
+    def setUp(self):
+        decompress._decode_cache.clear()
+        decompress._usage_cache.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.proxy_path = Path(self.tmp.name) / "proxy.db"
+        self.usage_path = Path(self.tmp.name) / "usage.db"
+        self.logs_path = Path(self.tmp.name) / "logs.db"
+        self.source = sqlite3.connect(self.proxy_path)
+        self.addCleanup(self.source.close)
+        self.source.executescript(self.PROXY_SCHEMA)
+        self.source.execute(
+            "INSERT INTO http_requests (id, timestamp, method, source_container_name, "
+            "source_container_id, host, path, body) "
+            "VALUES ('old', '2026-07-26T10:00:00+00:00', 'POST', 'vibepod-old-1', "
+            "'old1id000001', 'api.groq.com', '/v1/chat', ?)",
+            (json.dumps({"model": "l3"}).encode(),),
+        )
+        self.source.execute(
+            "INSERT INTO http_responses (request_id, timestamp, status_code, body) "
+            "VALUES ('old', '2026-07-26T10:00:01+00:00', 200, ?)",
+            (json.dumps({"usage": {"prompt_tokens": 12}}).encode(),),
+        )
+        self.source.commit()
+
+    def _logs(self, schema, insert):
+        logs = sqlite3.connect(self.logs_path)
+        self.addCleanup(logs.close)
+        logs.executescript(schema)
+        logs.execute(insert)
+        logs.commit()
+
+    def _profile(self):
+        conn = sqlite3.connect(self.usage_path)
+        self.addCleanup(conn.close)
+        return conn.execute("SELECT profile FROM token_usage WHERE request_id = 'old'").fetchone()[
+            0
+        ]
+
+    def test_proxy_db_without_a_profile_column_still_ingests_and_resolves(self):
+        self._logs(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT, workspace TEXT, "
+            "container_id TEXT, container_name TEXT, started_at TEXT, profile TEXT);",
+            "INSERT INTO sessions VALUES ('s1', 'agent', '/ws/old', 'old1id000001', "
+            "'vibepod-old-1', '2026-07-25T10:00:00+00:00', 'personal')",
+        )
+
+        counts = build_usage_cache.build(self.proxy_path, self.usage_path, self.logs_path)
+
+        self.assertEqual(counts["http"], 1)
+        self.assertEqual(self._profile(), "personal")
+
+    def test_logs_db_without_a_profile_column_leaves_the_profile_unresolved(self):
+        self._logs(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT, workspace TEXT, "
+            "container_id TEXT, container_name TEXT, started_at TEXT);",
+            "INSERT INTO sessions VALUES ('s1', 'agent', '/ws/old', 'old1id000001', "
+            "'vibepod-old-1', '2026-07-25T10:00:00+00:00')",
+        )
+
+        build_usage_cache.build(self.proxy_path, self.usage_path, self.logs_path)
+
+        # The workspace still resolves; only the profile has no source at all.
+        conn = sqlite3.connect(self.usage_path)
+        self.addCleanup(conn.close)
+        workspace, profile = conn.execute(
+            "SELECT workspace, profile FROM token_usage WHERE request_id = 'old'",
+        ).fetchone()
+        self.assertEqual(workspace, "/ws/old")
+        self.assertEqual(profile, "")
+
+        counts = build_usage_cache.sync_sessions(self.logs_path, conn, grace_seconds=0)
+        self.assertEqual(counts["profile"]["unknown"], 1)
+        self.assertEqual(self._profile(), "unknown")
 
 
 class PricingTests(unittest.TestCase):
@@ -1867,6 +2278,49 @@ class AgentTokenDashboardMetadataTests(unittest.TestCase):
         readme = (REPO_ROOT / "README.md").read_text()
 
         self.assertIn("/-/dashboards/agent-tokens", readme)
+
+    def test_profile_filter_and_panels_are_registered(self):
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        dashboard = metadata["plugins"]["datasette-dashboards"]["agent-tokens"]
+
+        self.assertEqual(dashboard["filters"]["profile"]["db"], "usage")
+        self.assertIn("FROM agent_token_usage", dashboard["filters"]["profile"]["query"])
+        for chart in ("tokens_by_profile", "active_profiles", "tokens_by_profile_agent"):
+            self.assertIn(chart, dashboard["charts"])
+        # The profile panels sit with the workspace ones, not at the bottom of
+        # an already long dashboard.
+        rows = ["".join(dict.fromkeys(row)) for row in dashboard["layout"]]
+        self.assertEqual(
+            rows.index("tokens_by_profileactive_profiles")
+            - rows.index(
+                "tokens_by_workspaceactive_workspaces",
+            ),
+            2,
+        )
+
+    def test_usage_canned_queries_cover_profiles(self):
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        queries = metadata["databases"]["usage"]["queries"]
+
+        self.assertIn("GROUP BY profile", queries["profile_token_totals"]["sql"])
+        self.assertIn("unknown-pending", queries["profile_resolution"]["sql"])
+
+    def test_filter_visibility_attributes_decisions_to_a_profile(self):
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        charts = metadata["plugins"]["datasette-dashboards"]["http-requests"]["charts"]
+
+        # Which profile a block came from is the point of the panel: without it
+        # a shared allow-list miss cannot be traced back to a filter file.
+        self.assertIn("decisions_by_profile", charts)
+        self.assertIn("r.blocked = 1", charts["decisions_by_profile"]["query"])
+        for chart in ("blocked_hosts_table", "passed_hosts_table", "recent_requests"):
+            self.assertIn("r.profile", charts[chart]["query"])
+
+    def test_recent_sessions_shows_the_profile_it_ran_under(self):
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        sessions = metadata["plugins"]["datasette-dashboards"]["agent-sessions"]["charts"]
+
+        self.assertIn("f.profile", sessions["recent_sessions"]["query"])
 
 
 class UsageCachePersistenceTests(unittest.TestCase):
