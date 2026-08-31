@@ -12,6 +12,8 @@ Datasette container for browsing both VibePod SQLite databases:
 - dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
 - `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
   attributed to the workspace each call came from via `logs.db`
+- token usage is priced from a bundled pricing dataset (`pricing/model_prices.json`), exposed
+  alongside usage as cost cards/tables on the `agent-tokens` dashboard
 
 ## Environment
 
@@ -24,6 +26,7 @@ Datasette container for browsing both VibePod SQLite databases:
   `PROXY_DB_PATH` so it persists across container recreation, falling back to
   `/data/usage.db` when that directory is not writable)
 - `USAGE_REFRESH_SECONDS` (default `300`, how often the cache picks up new traffic)
+- `PRICING_FILE_PATH` (model pricing JSON; defaults to the bundled `pricing/model_prices.json`)
 - `TRUNCATE_CELLS_HTML` (default `80`, compacts long cell values in list/table views)
 
 ## Usage
@@ -56,14 +59,18 @@ It includes:
 
 - total tokens, input, output, cached input, cache write, and reasoning summary cards
   (token counts are shown with a `tok` unit)
+- total cost and cost-by-agent chart (USD, real metered spend only)
+- estimated subscription value and estimated-value-by-agent chart (USD, what flat-rate
+  ChatGPT/Copilot usage would have cost on a metered API; see "How usage is priced" below)
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
 - tokens by workspace, split into input vs output series, plus a count of active workspaces
-- tokens by agent and model table, including cached and cache-write columns
+- tokens by agent and model table, including cached, cache-write, and cost columns
 - tokens by workspace and agent table
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
+- pricing-coverage table: calls per provider/model split into priced vs unpriced
 
 Available dashboard filters:
 
@@ -196,6 +203,63 @@ exactly once.
 If a host shows many `unparsed_calls`, that provider either does not report usage on the
 captured response or uses a field shape that is not mapped yet. Bodies are stored as sent
 by the server, so gzip, Zstandard, and Brotli responses are all decoded before parsing.
+
+### How usage is priced
+
+`pricing/model_prices.json` is a bundled, curated table of $-per-million-token rates per
+provider/model (input, output, cached input, cache write). `scripts/build_usage_cache.py`
+loads it into `usage.db`'s `model_pricing` table on every refresh, fully replacing the table
+each time: it is small, static reference data, not derived from captured traffic, so an entry
+removed from the file disappears from the table too. A missing or unreadable pricing file
+leaves the previous rows in place rather than wiping cost data over a transient error. Point
+`PRICING_FILE_PATH` at a different JSON file to override the bundled dataset.
+
+A call is priced by matching `model_pricing` rows for its provider and picking the one whose
+`model` is the **longest prefix** of the captured model string. An exact match is always the
+longest possible prefix, so this one rule covers both exact entries and dated snapshots (e.g.
+`claude-opus-4-5-20260101` prices as `claude-opus-4-5`) without separate logic. `reasoning_tokens`
+are already included in `output_tokens` by every provider's own accounting, so there is no
+separate reasoning price.
+
+Provider prices change over time, so `(provider, model)` can have several `model_pricing` rows
+with different `effective_from` dates rather than one fixed price. A call is priced at whichever
+rate was in effect on its own `timestamp` — the latest `effective_from` on or before that
+timestamp — never at today's rate, so historical cost totals stay correct after a price update.
+There is no explicit "effective to": a price's validity window implicitly ends at the next later
+`effective_from` row for that same `(provider, model)`, so adding a new price point never
+requires editing the old row. `pricing/model_prices.json` includes a real example of this
+(`openai`/`gpt-4o`'s August 2024 price cut) alongside single-point entries for models with only
+one known price so far.
+
+Flat-rate subscription traffic (`openai-codex` via a ChatGPT plan, `github-copilot`) has no real
+per-token bill, but it's still priced at the metered-API-equivalent rate of the underlying
+model — "what this would have cost" — so the value of the subscription is visible rather than
+hidden behind $0. Those rows are flagged `is_estimated = 1`, distinct from a metered API's real
+per-token price (`is_estimated = 0`), and every provider also gets a pricing row with
+`model = ''`: the empty string is a prefix of every model string, so it acts as a catch-all that
+only wins when no more specific entry exists for that provider (e.g. an unlisted Codex model
+still prices at the `gpt-5`-family estimate). Estimated cost is never summed into the same
+number as real spend (see below), so a flat-rate plan's estimate can't inflate the dashboard's
+"actual dollars" figure.
+
+The `agent_token_cost` view (usage.db) is `agent_token_usage` plus this price match and a
+computed `cost_usd`/`is_estimated`. Both `has_price` and `cost_usd` are only set when a call
+also has `has_usage = 1`: a call with no parsed token counts has nothing to price, regardless of
+whether a pricing entry exists for its model. On the `agent-tokens` dashboard, `total_cost` /
+`cost_by_agent` sum only real metered spend (`has_price = 1 AND is_estimated = 0`);
+`total_estimated_value` / `estimated_value_by_agent` sum only the subscription-equivalent
+estimate (`is_estimated = 1`) as a separate figure. The `tokens_by_agent_model` table and the
+`pricing_coverage` chart/query (also at `/-/queries/usage/pricing_coverage`) both report
+`real_cost_usd` and `estimated_cost_usd` as separate columns for the same reason, alongside
+`priced_calls`/`unpriced_calls` so calls with usage but no matching price stay visible instead of
+silently under-reporting. The current pricing table itself is queryable at
+`/-/queries/usage/model_pricing_table`.
+
+`pricing/model_prices.json` is manually maintained; update it directly (add a new row with a
+later `effective_from` for a price change, rather than editing the old one) and the next refresh
+picks it up, no rebuild step required. Some entries are placeholders for models newer than this
+dataset was last verified against (marked `PLACEHOLDER, unverified` in `price_source`) — check
+those against the provider's current pricing page before trusting them.
 
 ## HTTP Requests Dashboard
 

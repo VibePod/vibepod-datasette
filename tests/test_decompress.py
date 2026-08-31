@@ -473,6 +473,8 @@ class AgentTokenSqlTests(unittest.TestCase):
         for name, chart in charts.items():
             if chart["library"] != "metric":
                 continue
+            if name in ("total_cost", "total_estimated_value"):
+                continue
             with self.subTest(chart=name):
                 expected = (
                     " calls"
@@ -480,6 +482,140 @@ class AgentTokenSqlTests(unittest.TestCase):
                     else (" workspaces" if name == "active_workspaces" else " tok")
                 )
                 self.assertEqual(chart["display"]["suffix"], expected)
+
+    def test_cost_metric_uses_a_dollar_prefix(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+
+        self.assertEqual(charts["total_cost"]["display"]["prefix"], "$")
+        self.assertEqual(charts["total_estimated_value"]["display"]["prefix"], "$")
+
+    def test_dashboard_cost_charts_sum_bundled_pricing(self):
+        # claude-opus-4-5 is priced in the bundled pricing/model_prices.json at
+        # $5/$25 per 1M input/output tokens; round-numbered tokens make the
+        # expected cost easy to check end to end through the real pipeline.
+        self._request(
+            "r5",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "claude-opus-4-5",
+            container_id="abc1id123456",
+        )
+        self._response(
+            "r5",
+            json.dumps(
+                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+            ).encode(),
+        )
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        total_cost = self.conn.execute(charts["total_cost"]["query"], self.PARAMS).fetchone()[0]
+        by_agent = {
+            row[0]: row[1]
+            for row in self.conn.execute(charts["cost_by_agent"]["query"], self.PARAMS).fetchall()
+        }
+
+        # Real spend must not include the seeded codex call: it's flat-rate
+        # subscription traffic, priced only as an is_estimated value.
+        self.assertAlmostEqual(total_cost, 5.0 + 25.0)
+        self.assertAlmostEqual(by_agent["claude"], 5.0 + 25.0)
+        self.assertNotIn("codex", by_agent)
+
+    def test_dashboard_estimated_value_charts_cover_subscription_calls(self):
+        # The seeded codex call (r4: 700 input / 90 output tokens) has no
+        # provider-specific price, so it lands on the openai-codex catch-all
+        # ($1.25/$10 per 1M, is_estimated). This is the "what would this have
+        # cost on a metered API" figure, kept out of total_cost/cost_by_agent.
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        total_estimated_value = self.conn.execute(
+            charts["total_estimated_value"]["query"],
+            self.PARAMS,
+        ).fetchone()[0]
+        by_agent = {
+            row[0]: row[1]
+            for row in self.conn.execute(
+                charts["estimated_value_by_agent"]["query"],
+                self.PARAMS,
+            ).fetchall()
+        }
+
+        expected = round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4)
+        self.assertAlmostEqual(total_estimated_value, expected)
+        self.assertAlmostEqual(by_agent["codex"], expected)
+
+    def test_tokens_by_workspace_agent_includes_cost_columns(self):
+        # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
+        # claude-opus-4-5 at $5/$25 per 1M input/output tokens.
+        self._request(
+            "r5",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "claude-opus-4-5",
+            container_id="abc1id123456",
+        )
+        self._response(
+            "r5",
+            json.dumps(
+                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+            ).encode(),
+        )
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(charts["tokens_by_workspace_agent"]["query"], self.PARAMS)
+        columns = [c[0] for c in cursor.description]
+        rows = {(row[0], row[1]): row for row in cursor.fetchall()}
+        real_idx = columns.index("real_cost_usd")
+        estimated_idx = columns.index("estimated_cost_usd")
+
+        alpha_claude = rows[("alpha", "claude")]
+        self.assertAlmostEqual(alpha_claude[real_idx], 5.0 + 25.0)
+        self.assertAlmostEqual(alpha_claude[estimated_idx], 0.0)
+
+        # The seeded codex call is flat-rate subscription traffic: it prices
+        # only as an estimate, never as real spend.
+        gamma_codex = rows[("gamma", "codex")]
+        self.assertAlmostEqual(gamma_codex[real_idx], 0.0)
+        self.assertAlmostEqual(
+            gamma_codex[estimated_idx],
+            round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4),
+        )
+
+    def test_recent_calls_includes_cost_and_estimated_flag(self):
+        self._request(
+            "r5",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-claude-abc1",
+            "claude-opus-4-5",
+            container_id="abc1id123456",
+        )
+        self._response(
+            "r5",
+            json.dumps(
+                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+            ).encode(),
+        )
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(charts["recent_calls"]["query"], self.PARAMS)
+        columns = [c[0] for c in cursor.description]
+        # Keyed by model, not agent: r1 (model "opus") and r5 (model
+        # "claude-opus-4-5") share both an agent and a timestamp, so an
+        # agent-keyed dict could collapse onto either row.
+        rows = {row[columns.index("model")]: row for row in cursor.fetchall()}
+        cost_idx = columns.index("cost_usd")
+        estimated_idx = columns.index("is_estimated")
+
+        self.assertAlmostEqual(rows["claude-opus-4-5"][cost_idx], 5.0 + 25.0)
+        self.assertEqual(rows["claude-opus-4-5"][estimated_idx], 0)
+        self.assertEqual(rows["c"][estimated_idx], 1)
 
     def test_cache_write_card_sums_cache_creation_tokens(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
@@ -880,6 +1016,13 @@ class AgentTokenSqlTests(unittest.TestCase):
             "(source TEXT PRIMARY KEY, last_row_id INTEGER, updated_at TEXT)",
         )
         conn.execute("INSERT INTO sync_state VALUES ('http', 999, '2026-01-01')")
+        # Pre-dates is_estimated/effective_from: CREATE TABLE IF NOT EXISTS
+        # would otherwise leave this shape in place forever.
+        conn.execute(
+            "CREATE TABLE model_pricing (provider TEXT, model TEXT, "
+            "input_price_per_1m REAL, PRIMARY KEY (provider, model))",
+        )
+        conn.execute("INSERT INTO model_pricing VALUES ('stale', 'model', 1.0)")
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
         conn.close()
@@ -892,7 +1035,18 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertIn("response_id", columns)
         for col in ("container_id", "container_name", "workspace", "workspace_name"):
             self.assertIn(col, columns)
-        self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
+        pricing_columns = [row[1] for row in conn.execute("PRAGMA table_info(model_pricing)")]
+        for col in ("effective_from", "is_estimated"):
+            self.assertIn(col, pricing_columns)
+        # The stale row belonged to the old shape and was dropped with the table.
+        stale = conn.execute(
+            "SELECT 1 FROM model_pricing WHERE provider = 'stale'",
+        ).fetchone()
+        self.assertIsNone(stale)
+        self.assertEqual(
+            int(conn.execute("PRAGMA user_version").fetchone()[0]),
+            build_usage_cache.SCHEMA_VERSION,
+        )
         # The stale watermark was dropped, so everything is re-parsed.
         self.assertGreater(counts["http"], 0)
 
@@ -1262,6 +1416,331 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(build_usage_cache.agent_from_container(None), "unknown")
 
 
+class PricingTests(unittest.TestCase):
+    """agent_token_cost matching/cost logic, independent of the proxy pipeline.
+
+    These insert directly into usage.db's token_usage/model_pricing tables so
+    each scenario only sets up the columns it needs, instead of round-tripping
+    through a synthetic proxy.db (that full path is covered by
+    AgentTokenSqlTests.test_dashboard_cost_charts_sum_bundled_pricing).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.usage_path = Path(self.tmp.name) / "usage.db"
+        self.conn = build_usage_cache.open_cache(self.usage_path)
+        self.addCleanup(self.conn.close)
+
+    def _insert_usage(
+        self,
+        row_id,
+        provider,
+        model,
+        input_tokens=0,
+        output_tokens=0,
+        cached_tokens=0,
+        cache_write_tokens=0,
+        has_usage=1,
+        host="test.host",
+        agent="agent",
+        timestamp="2026-08-30T00:00:00+00:00",
+    ):
+        # Other columns (response_id, reasoning_tokens, container_id,
+        # container_name, workspace, workspace_name, ingested_at) are left to
+        # their table defaults; none of these tests exercise them.
+        self.conn.execute(
+            "INSERT INTO token_usage (source, row_id, request_id, timestamp, agent, "
+            "provider, model, host, input_tokens, output_tokens, cached_tokens, "
+            "cache_write_tokens, has_usage) VALUES ('http', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row_id,
+                f"req-{row_id}",
+                timestamp,
+                agent,
+                provider,
+                model,
+                host,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cache_write_tokens,
+                has_usage,
+            ),
+        )
+        self.conn.commit()
+
+    def _insert_price(
+        self,
+        provider,
+        model,
+        input_price=0,
+        output_price=0,
+        cached_price=0,
+        cache_write_price=0,
+        price_source="test",
+        # Old enough to be "in effect" for every call these tests insert,
+        # unless a test overrides it to exercise date-ranged pricing.
+        effective_from="2000-01-01",
+        is_estimated=False,
+    ):
+        self.conn.execute(
+            "INSERT INTO model_pricing (provider, model, effective_from, input_price_per_1m, "
+            "output_price_per_1m, cached_price_per_1m, cache_write_price_per_1m, currency, "
+            "is_estimated, price_source) VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?)",
+            (
+                provider,
+                model,
+                effective_from,
+                input_price,
+                output_price,
+                cached_price,
+                cache_write_price,
+                1 if is_estimated else 0,
+                price_source,
+            ),
+        )
+        self.conn.commit()
+
+    def _cost_row(self, row_id):
+        return self.conn.execute(
+            "SELECT has_price, cost_usd, is_estimated FROM agent_token_cost WHERE row_id = ?",
+            (row_id,),
+        ).fetchone()
+
+    def test_exact_match_prices_a_call(self):
+        self._insert_price("acme", "model-a", input_price=2.0, output_price=8.0)
+        self._insert_usage(1, "acme", "model-a", input_tokens=1_000_000, output_tokens=500_000)
+
+        has_price, cost, is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 1)
+        self.assertAlmostEqual(cost, 2.0 * 1 + 8.0 * 0.5)
+        self.assertEqual(is_estimated, 0)
+
+    def test_dated_snapshot_matches_via_longest_prefix(self):
+        self._insert_price("acme", "model-a", input_price=2.0, output_price=8.0)
+        self._insert_usage(1, "acme", "model-a-20260101", input_tokens=1_000_000)
+
+        has_price, cost, _is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 1)
+        self.assertAlmostEqual(cost, 2.0)
+
+    def test_more_specific_price_beats_shorter_prefix(self):
+        self._insert_price("acme", "model-a", input_price=2.0)
+        self._insert_price("acme", "model-a-20260101", input_price=9.0)
+        self._insert_usage(1, "acme", "model-a-20260101", input_tokens=1_000_000)
+
+        _has_price, cost, _is_estimated = self._cost_row(1)
+
+        self.assertAlmostEqual(cost, 9.0)
+
+    def test_no_matching_price_leaves_cost_null(self):
+        self._insert_usage(1, "acme", "unknown-model", input_tokens=1_000_000)
+
+        has_price, cost, is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 0)
+        self.assertIsNone(cost)
+        self.assertEqual(is_estimated, 0)
+
+    def test_price_change_uses_the_rate_in_effect_at_call_time(self):
+        # A real provider price cut: calls before the change price at the old
+        # rate, calls on/after it price at the new rate. "Now" (whenever the
+        # dashboard is viewed) must never leak into a historical call's cost.
+        self._insert_price(
+            "acme", "model-a", input_price=5.0, effective_from="2024-05-13",
+        )
+        self._insert_price(
+            "acme", "model-a", input_price=2.5, effective_from="2024-08-06",
+        )
+        self._insert_usage(
+            1, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-06-01T00:00:00+00:00",
+        )
+        self._insert_usage(
+            2, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-09-01T00:00:00+00:00",
+        )
+
+        before_change = self._cost_row(1)
+        after_change = self._cost_row(2)
+
+        self.assertAlmostEqual(before_change[1], 5.0)
+        self.assertAlmostEqual(after_change[1], 2.5)
+
+    def test_call_before_any_known_price_is_unpriced(self):
+        self._insert_price("acme", "model-a", input_price=2.5, effective_from="2024-08-06")
+        self._insert_usage(
+            1, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-01-01T00:00:00+00:00",
+        )
+
+        has_price, cost, _is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 0)
+        self.assertIsNone(cost)
+
+    def test_provider_catch_all_prices_every_model_at_its_rate(self):
+        # A subscription catch-all is priced at the metered-equivalent rate
+        # (not $0) and flagged is_estimated so it reads as "what this would
+        # cost", not real spend.
+        self._insert_price(
+            "acme-sub", "", input_price=2.0, output_price=8.0, is_estimated=True,
+        )
+        self._insert_usage(
+            1,
+            "acme-sub",
+            "whatever-model-string",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+
+        has_price, cost, is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 1)
+        self.assertAlmostEqual(cost, 2.0 + 8.0)
+        self.assertEqual(is_estimated, 1)
+
+    def test_specific_price_beats_provider_catch_all(self):
+        self._insert_price("acme-sub", "", input_price=0, output_price=0, is_estimated=True)
+        self._insert_price("acme-sub", "premium-model", input_price=5.0, output_price=5.0)
+        self._insert_usage(1, "acme-sub", "premium-model", input_tokens=1_000_000)
+
+        has_price, cost, is_estimated = self._cost_row(1)
+
+        self.assertAlmostEqual(cost, 5.0)
+        self.assertEqual(is_estimated, 0)
+
+    def test_call_without_parsed_usage_is_never_priced(self):
+        # A subscription catch-all would otherwise price this, hiding
+        # the fact that its actual token counts are unknown.
+        self._insert_price("acme-sub", "", input_price=2.0, output_price=8.0, is_estimated=True)
+        self._insert_usage(1, "acme-sub", "model-a", input_tokens=1_000_000, has_usage=0)
+
+        has_price, cost, _is_estimated = self._cost_row(1)
+
+        self.assertEqual(has_price, 0)
+        self.assertIsNone(cost)
+
+    def test_pricing_coverage_query_separates_priced_from_unpriced(self):
+        self._insert_price("acme", "model-a", input_price=2.0)
+        self._insert_usage(1, "acme", "model-a", input_tokens=1_000_000)
+        self._insert_usage(2, "acme", "unpriced-model", input_tokens=1_000_000)
+
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        sql = metadata["databases"]["usage"]["queries"]["pricing_coverage"]["sql"]
+        rows = {(r[0], r[1]): r for r in self.conn.execute(sql, {"limit": 100}).fetchall()}
+
+        self.assertEqual(rows[("acme", "model-a")][3], 1)
+        self.assertEqual(rows[("acme", "model-a")][4], 0)
+        self.assertEqual(rows[("acme", "unpriced-model")][3], 0)
+        self.assertEqual(rows[("acme", "unpriced-model")][4], 1)
+
+    def test_loader_is_idempotent_and_drops_removed_entries(self):
+        pricing_file = Path(self.tmp.name) / "prices.json"
+        pricing_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "provider": "a",
+                        "model": "x",
+                        "effective_from": "2024-01-01",
+                        "input_price_per_1m": 1,
+                    },
+                    {
+                        "provider": "a",
+                        "model": "y",
+                        "effective_from": "2024-01-01",
+                        "input_price_per_1m": 2,
+                    },
+                ],
+            ),
+        )
+
+        loaded = build_usage_cache.sync_pricing(self.conn, pricing_file)
+        self.assertEqual(loaded, 2)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0],
+            2,
+        )
+
+        # Re-running with the same file must not duplicate rows.
+        build_usage_cache.sync_pricing(self.conn, pricing_file)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0],
+            2,
+        )
+
+        # Removing an entry from the file removes it from the table too.
+        pricing_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "provider": "a",
+                        "model": "x",
+                        "effective_from": "2024-01-01",
+                        "input_price_per_1m": 1,
+                    },
+                ],
+            ),
+        )
+        build_usage_cache.sync_pricing(self.conn, pricing_file)
+        rows = self.conn.execute("SELECT provider, model FROM model_pricing").fetchall()
+        self.assertEqual(rows, [("a", "x")])
+
+    def test_missing_pricing_file_leaves_existing_rows_untouched(self):
+        self._insert_price("acme", "model-a", input_price=2.0)
+
+        loaded = build_usage_cache.sync_pricing(
+            self.conn,
+            Path(self.tmp.name) / "does-not-exist.json",
+        )
+
+        self.assertEqual(loaded, 0)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0],
+            1,
+        )
+
+    def test_malformed_entry_is_skipped_not_fatal(self):
+        pricing_file = Path(self.tmp.name) / "prices.json"
+        pricing_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "provider": "a",
+                        "model": "x",
+                        "effective_from": "2024-01-01",
+                        "input_price_per_1m": 1,
+                    },
+                    {"model": "missing-provider-key"},
+                ],
+            ),
+        )
+
+        loaded = build_usage_cache.sync_pricing(self.conn, pricing_file)
+
+        self.assertEqual(loaded, 1)
+
+    def test_bundled_pricing_file_loads_and_covers_subscription_providers(self):
+        loaded = build_usage_cache.sync_pricing(self.conn, build_usage_cache.default_pricing_path())
+
+        self.assertGreater(loaded, 0)
+        providers = {
+            row[0]
+            for row in self.conn.execute("SELECT DISTINCT provider FROM model_pricing").fetchall()
+        }
+        self.assertIn("openai-codex", providers)
+        self.assertIn("github-copilot", providers)
+        # Subscription catch-alls carry the metered-equivalent rate, not $0,
+        # and are flagged is_estimated since it's not real per-token spend.
+        catch_all = self.conn.execute(
+            "SELECT input_price_per_1m, is_estimated FROM model_pricing "
+            "WHERE provider = 'openai-codex' AND model = ''",
+        ).fetchone()
+        self.assertGreater(catch_all[0], 0)
+        self.assertEqual(catch_all[1], 1)
+
+
 class AgentTokenDashboardMetadataTests(unittest.TestCase):
     def test_dashboard_layout_and_charts_are_registered(self):
         metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
@@ -1277,7 +1756,12 @@ class AgentTokenDashboardMetadataTests(unittest.TestCase):
                 # Charts read the materialized cache; parsing bodies per render
                 # is what made this dashboard slow in the first place.
                 self.assertEqual(chart["db"], "usage")
-                self.assertIn("FROM agent_token_usage", chart["query"])
+                # agent_token_cost is agent_token_usage plus a price join, so
+                # both are reads of the materialized cache, never live bodies.
+                self.assertTrue(
+                    "FROM agent_token_usage" in chart["query"]
+                    or "FROM agent_token_cost" in chart["query"],
+                )
                 self.assertNotIn("extract_usage(", chart["query"])
 
     def test_agent_tokens_is_listed_first_and_legacy_dashboards_last(self):
