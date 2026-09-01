@@ -141,6 +141,22 @@
             "pricing_coverage"
           ],
           [
+            "unpriced_tokens",
+            "unpriced_tokens",
+            "unpriced_tokens",
+            "unpriced_impact",
+            "unpriced_impact",
+            "unpriced_impact"
+          ],
+          [
+            "pricing_quality",
+            "pricing_quality",
+            "pricing_quality",
+            "pricing_quality",
+            "pricing_quality",
+            "pricing_quality"
+          ],
+          [
             "cost_per_call_by_model",
             "cost_per_call_by_model",
             "cost_per_call_by_model",
@@ -693,6 +709,32 @@
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT provider, model, COUNT(*) AS calls, SUM(has_price) AS priced_calls, SUM(1 - has_price) AS unpriced_calls, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END), 4) AS real_cost_usd, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 1 THEN cost_usd ELSE 0 END), 4) AS estimated_cost_usd FROM priced GROUP BY provider, model ORDER BY unpriced_calls DESC, calls DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
             "library": "table",
             "display": {}
+          },
+          "unpriced_tokens": {
+            "title": "Tokens no rate could price",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COALESCE(SUM(CASE WHEN has_price = 0 THEN input_tokens + output_tokens ELSE 0 END), 0) AS unpriced_tokens FROM priced",
+            "library": "metric",
+            "display": {
+              "field": "unpriced_tokens",
+              "suffix": " tok"
+            }
+          },
+          "unpriced_impact": {
+            "title": "Unpriced volume at this window's average confirmed rate",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) , rate AS (SELECT SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END) AS cost, SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN input_tokens + output_tokens ELSE 0 END) AS tokens FROM priced) SELECT ROUND(SUM(CASE WHEN has_price = 0 THEN input_tokens + output_tokens ELSE 0 END) * (SELECT cost / NULLIF(tokens, 0) FROM rate), 4) AS unpriced_cost_estimate FROM priced",
+            "library": "metric",
+            "display": {
+              "field": "unpriced_cost_estimate",
+              "prefix": "$"
+            }
+          },
+          "pricing_quality": {
+            "title": "How each call was priced (match, fallback, or not at all)",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT provider, model, CASE WHEN has_price = 0 THEN 'unpriced' WHEN priced_model = '' THEN 'provider catch-all' WHEN is_estimated = 1 THEN 'placeholder rate' WHEN priced_model <> model THEN 'prefix match' ELSE 'exact rate' END AS match_status, COUNT(*) AS calls, SUM(input_tokens + output_tokens) AS total_tokens, ROUND(SUM(COALESCE(cost_usd, 0)), 4) AS cost_usd, price_effective_from, MAX(price_source) AS price_source, CAST(ROUND(AVG(julianday(timestamp) - julianday(price_effective_from))) AS INTEGER) AS price_age_days FROM priced GROUP BY provider, model, CASE WHEN has_price = 0 THEN 'unpriced' WHEN priced_model = '' THEN 'provider catch-all' WHEN is_estimated = 1 THEN 'placeholder rate' WHEN priced_model <> model THEN 'prefix match' ELSE 'exact rate' END, price_effective_from ORDER BY calls DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "library": "table"
           },
           "cost_per_call_by_model": {
             "title": "Cost per call by provider and model (confirmed prices)",
@@ -1904,6 +1946,10 @@
         "pricing_coverage": {
           "name": "Pricing coverage by provider and model",
           "sql": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE has_usage = 1) SELECT provider, model, COUNT(*) AS calls, SUM(has_price) AS priced_calls, SUM(1 - has_price) AS unpriced_calls, SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END) AS real_cost_usd, SUM(CASE WHEN has_price = 1 AND is_estimated = 1 THEN cost_usd ELSE 0 END) AS estimated_cost_usd FROM filtered GROUP BY provider, model ORDER BY unpriced_calls DESC, calls DESC LIMIT CAST(COALESCE(:limit, 100) AS INTEGER)"
+        },
+        "pricing_quality": {
+          "name": "Pricing match quality",
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT provider, model, CASE WHEN has_price = 0 THEN 'unpriced' WHEN priced_model = '' THEN 'provider catch-all' WHEN is_estimated = 1 THEN 'placeholder rate' WHEN priced_model <> model THEN 'prefix match' ELSE 'exact rate' END AS match_status, COUNT(*) AS calls, SUM(input_tokens + output_tokens) AS total_tokens, ROUND(SUM(COALESCE(cost_usd, 0)), 4) AS cost_usd, price_effective_from, MAX(price_source) AS price_source, CAST(ROUND(AVG(julianday(timestamp) - julianday(price_effective_from))) AS INTEGER) AS price_age_days FROM priced GROUP BY provider, model, CASE WHEN has_price = 0 THEN 'unpriced' WHEN priced_model = '' THEN 'provider catch-all' WHEN is_estimated = 1 THEN 'placeholder rate' WHEN priced_model <> model THEN 'prefix match' ELSE 'exact rate' END, price_effective_from ORDER BY calls DESC "
         },
         "cost_per_request": {
           "name": "Cost per request by provider and model",

@@ -551,6 +551,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                 "avg_cost_per_call",
                 "median_cost_per_call",
                 "p95_cost_per_call",
+                "unpriced_impact",
             }
             if name in priced_in_dollars or name == "cost_change":
                 continue
@@ -572,6 +573,7 @@ class AgentTokenSqlTests(unittest.TestCase):
             "avg_cost_per_call",
             "median_cost_per_call",
             "p95_cost_per_call",
+            "unpriced_impact",
         ):
             with self.subTest(chart=name):
                 self.assertEqual(charts[name]["display"]["prefix"], "$")
@@ -1007,6 +1009,87 @@ class AgentTokenSqlTests(unittest.TestCase):
         }
 
         self.assertEqual(rates, {"2024-05-13": 5.0, "2024-08-06": 2.5})
+
+    def _quality_rows(self, **params):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(
+            charts["pricing_quality"]["query"],
+            dict(self.PARAMS, **params),
+        )
+        columns = [c[0] for c in cursor.description]
+        return columns, cursor.fetchall()
+
+    def test_pricing_quality_names_how_each_call_was_priced(self):
+        # One call of each kind the matcher can produce.
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("q1", ts, 1_000_000, container="vibepod-qly-1")  # exact rate
+        self._seed_priced_call(
+            "q2",
+            ts,
+            1_000_000,
+            estimated=True,
+            container="vibepod-qly-1",
+        )  # placeholder
+        # A dated snapshot prices off the undated entry: matched by prefix.
+        self._request(
+            "q3",
+            "api.anthropic.com",
+            "/v1/messages",
+            "vibepod-qly-1",
+            "claude-opus-4-5-20260101",
+            ts=ts,
+        )
+        self._response(
+            "q3",
+            json.dumps({"usage": {"input_tokens": 1_000_000, "output_tokens": 0}}).encode(),
+            ts=ts,
+        )
+        # groq has no catch-all, so nothing can price this one at all.
+        self._request("q4", "api.groq.com", "/v1/chat", "vibepod-qly-1", "l3", ts=ts)
+        self._response("q4", json.dumps({"usage": {"prompt_tokens": 400}}).encode(), ts=ts)
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._quality_rows(agent="qly")
+        status = {row[columns.index("model")]: row[columns.index("match_status")] for row in rows}
+
+        self.assertEqual(status["claude-opus-4-5"], "exact rate")
+        self.assertEqual(status["gpt-5.6-sol"], "placeholder rate")
+        self.assertEqual(status["claude-opus-4-5-20260101"], "prefix match")
+        self.assertEqual(status["l3"], "unpriced")
+
+    def test_pricing_quality_reports_the_age_of_the_rate_it_applied(self):
+        # No staleness verdict: the age of the applied rate is a column, since
+        # an old rate is only a problem if the real price moved.
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("qa1", ts, 1_000_000, container="vibepod-qly-1")
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._quality_rows(agent="qly")
+        row = next(r for r in rows if r[columns.index("model")] == "claude-opus-4-5")
+
+        # claude-opus-4-5's confirmed rate is effective from 2025-11-01.
+        self.assertEqual(row[columns.index("price_effective_from")], "2025-11-01")
+        self.assertGreater(row[columns.index("price_age_days")], 280)
+
+    def test_unpriced_volume_is_reported_in_tokens_and_valued_transparently(self):
+        # A priced call sets the window's rate; an unpriced one of the same
+        # size should then be valued at that same rate.
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("ui1", ts, 1_000_000, container="vibepod-qly-1")  # $5 / 1M tokens
+        self._request("ui2", "api.groq.com", "/v1/chat", "vibepod-qly-1", "l3", ts=ts)
+        self._response("ui2", json.dumps({"usage": {"prompt_tokens": 1_000_000}}).encode(), ts=ts)
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        params = dict(self.PARAMS, agent="qly")
+        tokens = self.conn.execute(charts["unpriced_tokens"]["query"], params).fetchone()[0]
+        impact = self.conn.execute(charts["unpriced_impact"]["query"], params).fetchone()[0]
+
+        self.assertEqual(tokens, 1_000_000)
+        self.assertAlmostEqual(impact, 5.0, places=4)
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:

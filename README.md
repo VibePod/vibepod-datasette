@@ -76,6 +76,9 @@ It includes:
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
+- unpriced token volume, and what it would have cost at this window's confirmed rate
+- pricing-quality table: how each call was priced — exact rate, prefix match, provider
+  catch-all, placeholder, or not at all — with the age of the rate that was applied
 - cost-per-call table by provider and model, with the call counts each statistic rests on
 - most-expensive-calls table, ranked by cost and carrying the request id
 - outlier-calls table: calls costing at least 3x the median call of their own model
@@ -377,6 +380,28 @@ priced from a vague reference (`is_estimated = 1`) as a separate figure. The
 `priced_calls`/`unpriced_calls` so calls with usage but no matching price stay visible instead of
 silently under-reporting. The current pricing table itself is queryable at
 `/-/queries/usage/model_pricing_table`.
+
+### Pricing coverage and quality
+
+`pricing_quality` (chart, and `/-/queries/usage/pricing_quality`) says how every call got its
+price, which is the difference between "this cost $0" and "we could not price this":
+
+- **exact rate** — a pricing entry for that exact model string.
+- **prefix match** — a dated snapshot priced off its undated entry, e.g.
+  `claude-opus-4-5-20260101` at the `claude-opus-4-5` rate. Correct by design, but worth seeing.
+- **provider catch-all** — the `model = ''` row, applied because nothing more specific matched.
+- **placeholder rate** — a rate nobody has confirmed for that model.
+- **unpriced** — no entry matched at all, so the call has no cost and is missing from every
+  cost total.
+
+Each row carries the `price_effective_from` it used and how old that rate was when the call was
+made. There is deliberately no "stale" verdict: an old rate is only a problem if the real price
+moved, which the dataset cannot know, so the age is reported and the reader decides.
+
+Two cards size the gap: the token volume nothing could price, and what that volume **would**
+have cost at the average confirmed rate of the same window. The second is an extrapolation and
+its title says so — it answers "how much money is this coverage gap hiding", not "what was
+spent". With no confirmed calls in the window it is blank rather than zero.
 
 `pricing/model_prices.json` is manually maintained; update it directly (add a new row with a
 later `effective_from` for a price change, rather than editing the old one) and the next refresh
