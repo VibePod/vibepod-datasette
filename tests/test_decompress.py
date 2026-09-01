@@ -855,13 +855,58 @@ class AgentTokenSqlTests(unittest.TestCase):
                 self.assertEqual(len(rows), 366)
                 self.assertIn(ts[:10], [row[0] for row in rows])
 
-    def test_time_range_dropdown_offers_long_ranges(self):
+    def test_time_range_dropdown_offers_short_and_long_ranges(self):
         filters = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["filters"]
 
         self.assertEqual(
             filters["time_range"]["options"],
-            ["1h", "24h", "7d", "30d", "3m", "6m", "1y", "all"],
+            ["1h", "2h", "4h", "24h", "7d", "30d", "3m", "6m", "1y", "all"],
         )
+
+    def test_every_offered_time_range_narrows_the_charts(self):
+        # A range the dropdown offers but no chart's CASE maps silently falls
+        # through to the ELSE branch and quietly shows the wrong window.
+        filters = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["filters"]
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        ts = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+        self._seed_usage_call("tr1", ts, 7, 2, container="vibepod-trx-1")
+        self.source.commit()
+        self.refresh()
+
+        query = charts["total_tokens"]["query"]
+        seen = {}
+        for time_range in filters["time_range"]["options"]:
+            seen[time_range] = self.conn.execute(
+                query,
+                dict(self.PARAMS, time_range=time_range, agent="trx"),
+            ).fetchone()[0]
+
+        # The call is 3 hours old: inside 4h and everything longer, outside 1h/2h.
+        self.assertEqual(seen["1h"], 0)
+        self.assertEqual(seen["2h"], 0)
+        self.assertEqual(seen["4h"], 9)
+        self.assertEqual(seen["24h"], 9)
+        self.assertEqual(seen["all"], 9)
+
+    def test_auto_bucket_keeps_short_ranges_on_five_minute_slots(self):
+        # Auto must not drop a 2h/4h window onto daily slots -- that renders as
+        # a single bar and hides everything the short range was chosen to show.
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        for offset in (10, 100):
+            ts = (datetime.now(UTC) - timedelta(minutes=offset)).isoformat()
+            self._seed_usage_call(f"tb{offset}", ts, 5, 1, container="vibepod-tbx-1")
+        self.source.commit()
+        self.refresh()
+
+        buckets = {
+            row[0]
+            for row in self.conn.execute(
+                charts["token_trend"]["query"],
+                dict(self.PARAMS, time_range="4h", time_bucket="auto", agent="tbx"),
+            ).fetchall()
+        }
+
+        self.assertEqual(len(buckets), 2)
 
     def test_long_ranges_extend_existing_charts(self):
         # Dedicated agent so static seeds can't drift between buckets over time.

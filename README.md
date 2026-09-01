@@ -76,8 +76,8 @@ It includes:
 
 Available dashboard filters:
 
-- time range (`1h`, `24h`, `7d`, `30d`, `all`; default `24h`)
-- trend bucket (`auto`, `5min`, `hour`, `day`; `auto` uses 5-minute slots for `1h`,
+- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `3m`, `6m`, `1y`, `all`; default `24h`)
+- trend bucket (`auto`, `5min`, `hour`, `day`; `auto` uses 5-minute slots up to `4h`,
   hourly for `24h`, and daily beyond that)
 - agent (derived from `source_container_name`, e.g. `vibepod-tau-...` -> `tau`)
 - workspace (the directory the agent ran in, resolved from `logs.db`; see below)
@@ -315,7 +315,7 @@ It includes:
 
 Available dashboard filters/sorting:
 
-- time range (`1h`, `24h`, `7d`, `30d`, `all`)
+- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `all`)
 - host substring match
 - method filter
 - agent filter (derived from `source_container_name`, e.g. `vibepod-codex-...` -> `codex`)
@@ -349,7 +349,7 @@ It includes:
 
 Available dashboard filters:
 
-- time range (`1h`, `24h`, `7d`, `30d`, `all`)
+- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `all`)
 - trend bucket (`auto`, `hour`, `day`)
 - model
 - container
