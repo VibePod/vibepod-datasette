@@ -62,6 +62,8 @@ It includes:
 - total cost and cost-by-agent chart (USD, calls priced from a confirmed rate only)
 - estimated cost and estimated-cost-by-agent chart (USD, calls priced from a vague
   reference — a placeholder or a provider catch-all; see "How usage is priced" below)
+- cost over time, confirmed vs estimated, at the selected bucket, plus a card comparing
+  confirmed cost with the previous window of the same length (see "Cost over time" below)
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
@@ -77,14 +79,44 @@ It includes:
 Available dashboard filters:
 
 - time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `3m`, `6m`, `1y`, `all`; default `24h`)
-- trend bucket (`auto`, `5min`, `hour`, `day`; `auto` uses 5-minute slots up to `4h`,
-  hourly for `24h`, and daily beyond that)
+- trend bucket (`auto`, `5min`, `hour`, `day`, `week`, `month`; `auto` uses 5-minute slots
+  up to `4h`, hourly for `24h`, and daily beyond that)
 - agent (derived from `source_container_name`, e.g. `vibepod-tau-...` -> `tau`)
 - workspace (the directory the agent ran in, resolved from `logs.db`; see below)
 - profile (the proxy filter profile the call ran under; see below)
 - provider (`anthropic`, `openai-codex`, `google`, `groq`, ... derived from the request host)
+- model (as reported by the response, so a dated snapshot appears under its own name)
 - host
 - table row limit
+
+### Cost over time
+
+The cost trend charts spend per period at the selected trend bucket, so the same chart answers
+daily, weekly, and monthly with the `day`, `week`, and `month` buckets — a week starts on its
+Monday, a month on the 1st. Confirmed and estimated cost are separate stacked series, never one
+total, for the reason in "How usage is priced" below.
+
+It uses the same line mark as the token trend, and both trends bind their legend: click a
+legend entry to isolate that series (the others fade out), click it again to bring them back. A bucket with calls but no cost on one series
+reports zero, so the line dips through it instead of being drawn straight from the previous
+point to the next; a bucket with no calls at all produces no point, exactly as on the token
+trend. A period where calls happened but nothing could be priced reads as zero on a *cost*
+chart — the pricing-coverage table is where unpriced calls show up.
+
+Next to it, a card reports the **percentage change in confirmed cost** between two rolling
+windows: the selected range ending now, and the window of the same length immediately before it.
+At the default `24h` that is the last 24 hours against the 24 hours before those; at `7d`, the
+last seven days against the seven before. These are rolling windows anchored on the current
+time, not calendar days or weeks, so both sides are always the same length. Every other filter
+(agent, workspace, profile, provider, model, host) applies to both windows, and estimated cost is
+excluded from both — this card is about money with a confirmed price behind it. It reads blank
+rather than showing a number in the two cases where a percentage would be meaningless: the `all`
+range, which has no preceding window, and a previous window with no confirmed spend, which has
+nothing to divide by.
+
+`cost_over_time` (`/-/queries/usage/cost_over_time`) returns the same per-period figures as a
+table — calls, confirmed cost, estimated cost, and tokens — for reconciling the chart against
+the underlying rows.
 
 ### How tokens are attributed to a workspace
 

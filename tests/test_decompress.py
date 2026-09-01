@@ -195,6 +195,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         "host": "all",
         "workspace": "all",
         "profile": "all",
+        "model": "all",
         "limit": 200,
         "request_limit": 100,
     }
@@ -544,7 +545,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         for name, chart in charts.items():
             if chart["library"] != "metric":
                 continue
-            if name in ("total_cost", "total_estimated_value"):
+            if name in ("total_cost", "total_estimated_value", "cost_change"):
                 continue
             counted = {
                 "calls_with_usage": " calls",
@@ -671,6 +672,163 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertAlmostEqual(total_estimated_value, placeholder + codex_catch_all, places=4)
         self.assertAlmostEqual(by_agent["openai"], placeholder, places=4)
         self.assertAlmostEqual(by_agent["codex"], codex_catch_all, places=4)
+
+    def _seed_priced_call(self, rid, ts, tokens, estimated=False, container="vibepod-cst-1"):
+        """One call that prices at a known figure, on either side of is_estimated."""
+        if estimated:
+            # gpt-5.6-sol is a PLACEHOLDER rate: $1.25 per 1M input tokens.
+            self._request(
+                rid, "api.openai.com", "/v1/chat/completions", container, "gpt-5.6-sol", ts=ts
+            )
+            body = {
+                "model": "gpt-5.6-sol",
+                "usage": {"prompt_tokens": tokens, "completion_tokens": 0},
+            }
+        else:
+            # claude-opus-4-5 is a confirmed rate: $5.00 per 1M input tokens.
+            self._request(
+                rid, "api.anthropic.com", "/v1/messages", container, "claude-opus-4-5", ts=ts
+            )
+            body = {"usage": {"input_tokens": tokens, "output_tokens": 0}}
+        self._response(rid, json.dumps(body).encode(), ts=ts)
+
+    def _cost_trend(self, **params):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        rows = self.conn.execute(
+            charts["cost_trend"]["query"],
+            dict(self.PARAMS, agent="cst", **params),
+        ).fetchall()
+        return {(row[0], row[1]): row[2] for row in rows}
+
+    def test_cost_trend_splits_confirmed_and_estimated_per_bucket(self):
+        older = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00+00:00")
+        newer = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
+        self._seed_priced_call("ct1", older, 1_000_000)
+        self._seed_priced_call("ct2", newer, 1_000_000)
+        self._seed_priced_call("ct3", newer, 2_000_000)
+        self._seed_priced_call("ct4", newer, 1_000_000, estimated=True)
+        self.source.commit()
+        self.refresh()
+
+        rows = self._cost_trend(time_bucket="day")
+
+        older_day, newer_day = older[:10], newer[:10]
+        self.assertAlmostEqual(rows[(older_day, "confirmed")], 5.0)
+        self.assertAlmostEqual(rows[(newer_day, "confirmed")], 15.0)
+        self.assertAlmostEqual(rows[(newer_day, "estimated")], 1.25)
+        # A bucket with calls but nothing on this series reports zero rather
+        # than dropping out: the line would otherwise be drawn straight from
+        # the previous point to the next, across a period that spent nothing.
+        self.assertAlmostEqual(rows[(older_day, "estimated")], 0.0)
+
+    def test_cost_trend_buckets_by_week_and_month(self):
+        # Two calls ~5 weeks apart: same quarter, different weeks and months.
+        first = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m-%dT10:00:00+00:00")
+        second = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT10:00:00+00:00")
+        self._seed_priced_call("cw1", first, 1_000_000)
+        self._seed_priced_call("cw2", second, 1_000_000)
+        self.source.commit()
+        self.refresh()
+
+        weekly = self._cost_trend(time_range="3m", time_bucket="week")
+        monthly = self._cost_trend(time_range="3m", time_bucket="month")
+
+        self.assertEqual(len({bucket for bucket, _series in weekly}), 2)
+        self.assertEqual(len({bucket for bucket, _series in monthly}), 2)
+        # Week buckets start on a Monday; month buckets on the first.
+        for bucket, _series in weekly:
+            self.assertEqual(datetime.fromisoformat(bucket).weekday(), 0)
+        for bucket, _series in monthly:
+            self.assertTrue(bucket.endswith("-01"), bucket)
+        self.assertAlmostEqual(sum(weekly.values()), sum(monthly.values()))
+
+    def test_cost_change_compares_against_the_previous_window(self):
+        current = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        previous = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+        self._seed_priced_call("cc1", current, 1_000_000)  # $5 this 24h
+        self._seed_priced_call("cc2", previous, 2_000_000)  # $10 the 24h before
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        change = self.conn.execute(
+            charts["cost_change"]["query"],
+            dict(self.PARAMS, agent="cst", time_range="24h"),
+        ).fetchone()[0]
+
+        self.assertAlmostEqual(change, -50.0)
+
+    def test_cost_change_reports_nothing_without_a_comparable_window(self):
+        # 'all' has no preceding window, and a previous period of $0 would
+        # divide by zero: both must read as blank, not as 0% or infinity.
+        self._seed_priced_call("cn1", datetime.now(UTC).isoformat(), 1_000_000)
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        for time_range in ("all", "24h"):
+            with self.subTest(time_range=time_range):
+                change = self.conn.execute(
+                    charts["cost_change"]["query"],
+                    dict(self.PARAMS, agent="cst", time_range=time_range),
+                ).fetchone()[0]
+                self.assertIsNone(change)
+
+    def test_cost_over_time_query_reconciles_with_the_chart(self):
+        ts = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
+        self._seed_priced_call("cr1", ts, 1_000_000)
+        self._seed_priced_call("cr2", ts, 1_000_000, estimated=True)
+        self.source.commit()
+        self.refresh()
+
+        sql = self.metadata["databases"]["usage"]["queries"]["cost_over_time"]["sql"]
+        rows = {
+            row[0]: row
+            for row in self.conn.execute(sql, dict(self.PARAMS, agent="cst", time_bucket="day"))
+        }
+        charted = self._cost_trend(time_bucket="day")
+
+        day = ts[:10]
+        self.assertAlmostEqual(rows[day][2], charted[(day, "confirmed")])
+        self.assertAlmostEqual(rows[day][3], charted[(day, "estimated")])
+
+    def test_model_filter_narrows_the_charts(self):
+        ts = datetime.now(UTC).isoformat()
+        self._seed_priced_call("cm1", ts, 1_000_000)
+        self._seed_priced_call("cm2", ts, 1_000_000, estimated=True)
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        total = self.conn.execute(
+            charts["total_cost"]["query"],
+            dict(self.PARAMS, agent="cst", model="claude-opus-4-5"),
+        ).fetchone()[0]
+
+        self.assertAlmostEqual(total, 5.0)
+
+    def test_trend_legends_isolate_a_single_series(self):
+        # The legend binding is what lets a reader look at one series alone;
+        # without the opacity condition the click has no visible effect.
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+
+        for name in ("token_trend", "cost_trend"):
+            with self.subTest(chart=name):
+                display = charts[name]["display"]
+                param = display["params"][0]
+                self.assertEqual(param["bind"], "legend")
+                self.assertEqual(param["select"]["fields"], ["series"])
+                condition = display["encoding"]["opacity"]["condition"]
+                self.assertEqual(condition["param"], param["name"])
+                # An empty selection must match everything, or the chart opens
+                # with every series dimmed until something is clicked.
+                self.assertTrue(condition["empty"])
+
+    def test_every_chart_query_references_model_filter(self):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        for name, chart in charts.items():
+            with self.subTest(chart=name):
+                self.assertIn(":model", chart["query"])
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
@@ -1019,12 +1177,12 @@ class AgentTokenSqlTests(unittest.TestCase):
         slot -= timedelta(minutes=slot.minute % 5)
         self.assertEqual(buckets, [slot.strftime("%Y-%m-%d %H:%M:%S")])
 
-    def test_bucket_filter_offers_five_minute_option(self):
+    def test_bucket_filter_spans_five_minutes_to_months(self):
         filters = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["filters"]
 
         self.assertEqual(
             filters["time_bucket"]["options"],
-            ["auto", "5min", "hour", "day"],
+            ["auto", "5min", "hour", "day", "week", "month"],
         )
 
     def test_bar_charts_split_input_and_output_series(self):
