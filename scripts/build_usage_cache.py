@@ -533,6 +533,13 @@ def sync_pricing(cache: sqlite3.Connection, pricing_path: Path) -> int:
     except (OSError, ValueError) as exc:
         print(f"pricing cache: skipped ({exc})", file=sys.stderr, flush=True)
         return 0
+    if not isinstance(entries, list):
+        print(
+            f"pricing cache: skipped ({pricing_path} is not a list of entries)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
 
     rows = []
     for entry in entries:
@@ -590,6 +597,15 @@ def _newest_before(windows, ts):
     return best
 
 
+def _earliest(windows):
+    """The candidate that started first; row order otherwise, which is
+    whatever the sessions query returned, is not a defined order."""
+    dated = [(started, w) for w in windows if (started := _parse_ts(w.started_at)) is not None]
+    if not dated:
+        return windows[0]
+    return min(dated, key=lambda pair: pair[0])[1]
+
+
 def resolve_session(container_id12: str, container_name: str, ts, windows):
     """Match a call to its container's session: exact id first, name fallback.
 
@@ -609,7 +625,7 @@ def resolve_session(container_id12: str, container_name: str, ts, windows):
     """
     by_id = [w for w in windows if w.container_id12 and w.container_id12 == container_id12]
     if by_id:
-        return (_newest_before(by_id, ts) or by_id[0], "by_id")
+        return (_newest_before(by_id, ts) or _earliest(by_id), "by_id")
     by_name = [w for w in windows if w.container_name == container_name]
     match = _newest_before(by_name, ts)
     if match is None:

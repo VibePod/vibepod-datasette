@@ -2182,6 +2182,39 @@ class AgentTokenSqlTests(unittest.TestCase):
             build_usage_cache.resolve_session("abc1idxxxxxx", "vibepod-nope", ts, windows),
         )
 
+    def test_resolve_session_falls_back_to_the_earliest_not_the_first_row(self):
+        # The sessions query has no ORDER BY, so "the first row" is whatever
+        # SQLite returned. A call older than every session of its container
+        # must land on the earliest one whichever order they arrive in.
+        late = self._window(
+            "ord1id000001",
+            "vibepod-ord-1",
+            "/hs/ord",
+            "work",
+            "sess-late",
+            "2026-07-26T10:00:00+00:00",
+        )
+        early = self._window(
+            "ord1id000001",
+            "vibepod-ord-1",
+            "/hs/ord",
+            "work",
+            "sess-early",
+            "2026-07-20T10:00:00+00:00",
+        )
+        before_any = build_usage_cache._parse_ts("2026-07-01T10:00:00+00:00")
+
+        for windows in ([late, early], [early, late]):
+            with self.subTest(order=[w.session_id for w in windows]):
+                window, path = build_usage_cache.resolve_session(
+                    "ord1id000001",
+                    "x",
+                    before_any,
+                    windows,
+                )
+                self.assertEqual(window.session_id, "sess-early")
+                self.assertEqual(path, "by_id")
+
     def test_resolve_session_picks_the_session_the_call_belongs_to(self):
         # One container can host several sessions (re-attaching opens another),
         # so the id alone names the container, not the session; the call's own
@@ -3061,6 +3094,28 @@ class PricingTests(unittest.TestCase):
         loaded = build_usage_cache.sync_pricing(self.conn, pricing_file)
 
         self.assertEqual(loaded, 1)
+
+    def test_a_pricing_file_that_is_not_a_list_leaves_the_table_alone(self):
+        # Iterating a dict yields its keys, so every "entry" was malformed and
+        # the wholesale replace ran with zero rows: a stray {} used to wipe
+        # every price in the cache.
+        build_usage_cache.sync_pricing(self.conn, build_usage_cache.default_pricing_path())
+        before = self.conn.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0]
+        self.assertGreater(before, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("{}", "null", '"nope"', "42"):
+                with self.subTest(content=content):
+                    path = Path(tmp) / "prices.json"
+                    path.write_text(content)
+
+                    loaded = build_usage_cache.sync_pricing(self.conn, path)
+
+                    self.assertEqual(loaded, 0)
+                    self.assertEqual(
+                        self.conn.execute("SELECT COUNT(*) FROM model_pricing").fetchone()[0],
+                        before,
+                    )
 
     def test_bundled_pricing_file_flags_only_vague_references_as_estimated(self):
         loaded = build_usage_cache.sync_pricing(self.conn, build_usage_cache.default_pricing_path())
