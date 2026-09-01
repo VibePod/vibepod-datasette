@@ -545,7 +545,14 @@ class AgentTokenSqlTests(unittest.TestCase):
         for name, chart in charts.items():
             if chart["library"] != "metric":
                 continue
-            if name in ("total_cost", "total_estimated_value", "cost_change"):
+            priced_in_dollars = {
+                "total_cost",
+                "total_estimated_value",
+                "avg_cost_per_call",
+                "median_cost_per_call",
+                "p95_cost_per_call",
+            }
+            if name in priced_in_dollars or name == "cost_change":
                 continue
             counted = {
                 "calls_with_usage": " calls",
@@ -559,8 +566,15 @@ class AgentTokenSqlTests(unittest.TestCase):
     def test_cost_metric_uses_a_dollar_prefix(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
 
-        self.assertEqual(charts["total_cost"]["display"]["prefix"], "$")
-        self.assertEqual(charts["total_estimated_value"]["display"]["prefix"], "$")
+        for name in (
+            "total_cost",
+            "total_estimated_value",
+            "avg_cost_per_call",
+            "median_cost_per_call",
+            "p95_cost_per_call",
+        ):
+            with self.subTest(chart=name):
+                self.assertEqual(charts[name]["display"]["prefix"], "$")
 
     def test_dashboard_cost_charts_sum_bundled_pricing(self):
         # claude-opus-4-5 is priced in the bundled pricing/model_prices.json at
@@ -830,6 +844,108 @@ class AgentTokenSqlTests(unittest.TestCase):
         for name, chart in charts.items():
             with self.subTest(chart=name):
                 self.assertIn(":model", chart["query"])
+
+    def _percentile_cards(self, **params):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        return {
+            name: self.conn.execute(
+                charts[name]["query"],
+                dict(self.PARAMS, agent="pct", **params),
+            ).fetchone()[0]
+            for name in ("avg_cost_per_call", "median_cost_per_call", "p95_cost_per_call")
+        }
+
+    def test_cost_percentiles_match_a_known_distribution(self):
+        # Ten calls at $1..$10 of confirmed cost: mean 5.5, median 5.5 (the two
+        # middle ranks averaged), p95 at nearest rank ceil(0.95 * 10) = 10.
+        ts = datetime.now(UTC).isoformat()
+        for i in range(1, 11):
+            self._seed_priced_call(f"pc{i}", ts, i * 200_000, container="vibepod-pct-1")
+        self.source.commit()
+        self.refresh()
+
+        cards = self._percentile_cards()
+
+        self.assertAlmostEqual(cards["avg_cost_per_call"], 5.5, places=4)
+        self.assertAlmostEqual(cards["median_cost_per_call"], 5.5, places=4)
+        self.assertAlmostEqual(cards["p95_cost_per_call"], 10.0, places=4)
+
+    def test_cost_percentiles_handle_an_odd_count(self):
+        # Three calls at $1/$2/$3: the median is the single middle rank, and
+        # p95 is ceil(0.95 * 3) = rank 3.
+        ts = datetime.now(UTC).isoformat()
+        for i in range(1, 4):
+            self._seed_priced_call(f"po{i}", ts, i * 200_000, container="vibepod-pct-1")
+        self.source.commit()
+        self.refresh()
+
+        cards = self._percentile_cards()
+
+        self.assertAlmostEqual(cards["median_cost_per_call"], 2.0, places=4)
+        self.assertAlmostEqual(cards["p95_cost_per_call"], 3.0, places=4)
+
+    def test_cost_percentiles_ignore_calls_without_a_confirmed_price(self):
+        # An estimated call must not drag the distribution: these statistics
+        # describe money with a confirmed rate behind it.
+        ts = datetime.now(UTC).isoformat()
+        self._seed_priced_call("pe1", ts, 1_000_000, container="vibepod-pct-1")
+        self._seed_priced_call("pe2", ts, 1_000_000, container="vibepod-pct-1", estimated=True)
+        self.source.commit()
+        self.refresh()
+
+        cards = self._percentile_cards()
+
+        self.assertAlmostEqual(cards["avg_cost_per_call"], 5.0, places=4)
+
+    def test_cost_per_call_by_model_shows_what_each_average_rests_on(self):
+        # A segment whose calls are mostly unpriced would otherwise report a
+        # confident average drawn from a couple of rows.
+        ts = datetime.now(UTC).isoformat()
+        self._seed_priced_call("ps1", ts, 1_000_000, container="vibepod-pct-1")
+        self._seed_priced_call("ps2", ts, 1_000_000, container="vibepod-pct-1", estimated=True)
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(
+            charts["cost_per_call_by_model"]["query"],
+            dict(self.PARAMS, agent="pct"),
+        )
+        columns = [c[0] for c in cursor.description]
+        rows = {
+            (row[columns.index("provider")], row[columns.index("model")]): row for row in cursor
+        }
+
+        confirmed = rows[("anthropic", "claude-opus-4-5")]
+        self.assertEqual(confirmed[columns.index("calls")], 1)
+        self.assertEqual(confirmed[columns.index("confirmed_calls")], 1)
+        self.assertAlmostEqual(confirmed[columns.index("avg_cost_usd")], 5.0, places=4)
+
+        # The estimated-only segment is still listed, with no percentiles and
+        # its call counted, rather than dropped by the confirmed-price join.
+        estimated = rows[("openai", "gpt-5.6-sol")]
+        self.assertEqual(estimated[columns.index("confirmed_calls")], 0)
+        self.assertEqual(estimated[columns.index("estimated_calls")], 1)
+        self.assertIsNone(estimated[columns.index("avg_cost_usd")])
+
+    def test_most_expensive_calls_are_ranked_and_traceable(self):
+        ts = datetime.now(UTC).isoformat()
+        self._seed_priced_call("mx1", ts, 1_000_000, container="vibepod-pct-1")
+        self._seed_priced_call("mx2", ts, 3_000_000, container="vibepod-pct-1")
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(
+            charts["most_expensive_calls"]["query"],
+            dict(self.PARAMS, agent="pct"),
+        )
+        columns = [c[0] for c in cursor.description]
+        rows = cursor.fetchall()
+
+        self.assertAlmostEqual(rows[0][columns.index("cost_usd")], 15.0, places=4)
+        # The request id is what makes an outlier followable into proxy.db.
+        self.assertEqual(rows[0][columns.index("request_id")], "mx2")
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:

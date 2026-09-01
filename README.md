@@ -63,6 +63,7 @@ It includes:
   reference — a placeholder or a provider catch-all; see "How usage is priced" below)
 - cost over time, confirmed vs estimated, at the selected bucket, plus a card comparing
   confirmed cost with the previous window of the same length (see "Cost over time" below)
+- average, median and p95 cost per call (confirmed prices; see "Cost per call" below)
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
@@ -75,6 +76,8 @@ It includes:
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
+- cost-per-call table by provider and model, with the call counts each statistic rests on
+- most-expensive-calls table, ranked by cost and carrying the request id
 
 Available dashboard filters:
 
@@ -117,6 +120,27 @@ nothing to divide by.
 `cost_over_time` (`/-/queries/usage/cost_over_time`) returns the same per-period figures as a
 table — calls, confirmed cost, estimated cost, and tokens — for reconciling the chart against
 the underlying rows.
+
+### Cost per call
+
+Three cards report the distribution of what a single call costs — average, median and p95 — over
+calls priced from a **confirmed** rate. Estimated ones are excluded on purpose: a placeholder or
+a catch-all rate would move a percentile without anyone having verified the number behind it.
+
+SQLite has no percentile function, so the rows are ranked and the statistic is read off the
+ranking: the median averages the one or two middle ranks (so an even count works), and p95 is the
+nearest-rank definition with the ceiling written as integer arithmetic, because `ceil()` is only
+present when SQLite was compiled with its math functions.
+
+`cost_per_call_by_model` repeats all of it per provider and model, next to the call counts each
+statistic rests on: total calls, how many had a confirmed price, how many were estimated, and how
+many could not be priced at all. A segment priced from two of its two hundred calls is then
+visibly that, instead of showing a confident-looking average. Segments with no confirmed price
+still appear, with empty statistics, rather than dropping out of the table.
+`cost_per_request` (`/-/queries/usage/cost_per_request`) is the same figures as a query.
+
+The most-expensive-calls table ranks individual calls and carries each one's `request_id`, which
+is the key to look the call up in `proxy.db` where its request and response bodies live.
 
 ### How tokens are attributed to a workspace
 
