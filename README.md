@@ -78,6 +78,8 @@ It includes:
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
 - cost-per-call table by provider and model, with the call counts each statistic rests on
 - most-expensive-calls table, ranked by cost and carrying the request id
+- outlier-calls table: calls costing at least 3x the median call of their own model
+- rate-changes table: models billed at more than one rate inside the window
 
 Available dashboard filters:
 
@@ -141,6 +143,16 @@ still appear, with empty statistics, rather than dropping out of the table.
 
 The most-expensive-calls table ranks individual calls and carries each one's `request_id`, which
 is the key to look the call up in `proxy.db` where its request and response bodies live.
+
+Two further tables answer questions the totals cannot. **Outlier calls** are judged against the
+median call of their *own* model rather than a global one — $5 is unremarkable for Opus and
+absurd for Haiku — and only for models with at least five calls in the window, so nothing is
+flagged on the evidence of two; each row carries that median, the ratio, and the `request_id`.
+**Models billed at more than one rate** in the window surface separately, because a rate change
+moves cost while usage stands still, and would otherwise read as a usage change. That table is
+the one place estimated rows are kept: a placeholder replaced by a confirmed rate is itself a
+pricing change, and its `is_estimated` column keeps a change of rate distinct from a change of
+confidence.
 
 ### How tokens are attributed to a workspace
 

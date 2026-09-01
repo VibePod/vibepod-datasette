@@ -947,6 +947,67 @@ class AgentTokenSqlTests(unittest.TestCase):
         # The request id is what makes an outlier followable into proxy.db.
         self.assertEqual(rows[0][columns.index("request_id")], "mx2")
 
+    def _outlier_chart(self, name, **params):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(
+            charts[name]["query"],
+            dict(self.PARAMS, agent="anm", time_bucket="day", **params),
+        )
+        columns = [c[0] for c in cursor.description]
+        return columns, cursor.fetchall()
+
+    def test_outlier_calls_are_judged_against_their_own_model(self):
+        ts = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
+        for i in range(5):
+            self._seed_priced_call(f"ol{i}", ts, 200_000, container="vibepod-anm-1")
+        self._seed_priced_call("olx", ts, 2_000_000, container="vibepod-anm-1")
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._outlier_chart("outlier_calls")
+
+        self.assertEqual([row[columns.index("request_id")] for row in rows], ["olx"])
+        self.assertAlmostEqual(rows[0][columns.index("model_median_cost_usd")], 1.0, places=4)
+        self.assertAlmostEqual(rows[0][columns.index("vs_median")], 10.0, places=1)
+
+    def test_outliers_need_a_segment_big_enough_to_have_a_median(self):
+        ts = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00+00:00")
+        self._seed_priced_call("os1", ts, 200_000, container="vibepod-anm-1")
+        self._seed_priced_call("os2", ts, 2_000_000, container="vibepod-anm-1")
+        self.source.commit()
+        self.refresh()
+
+        _columns, rows = self._outlier_chart("outlier_calls")
+
+        self.assertEqual(rows, [])
+
+    def test_rate_changes_show_both_rates_a_model_was_billed_at(self):
+        # gpt-4o's bundled pricing has a real price cut: $5/1M before
+        # 2024-08-06 and $2.50 after. Calls either side must surface as one
+        # model billed at two rates, which moves cost without usage moving.
+        for rid, ts in (("rc1", "2024-06-01T10:00:00+00:00"), ("rc2", "2024-09-01T10:00:00+00:00")):
+            self._request("x" + rid, "api.openai.com", "/v1/chat", "vibepod-anm-1", "gpt-4o", ts=ts)
+            self._response(
+                "x" + rid,
+                json.dumps(
+                    {
+                        "model": "gpt-4o",
+                        "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0},
+                    },
+                ).encode(),
+                ts=ts,
+            )
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._outlier_chart("rate_changes")
+        rates = {
+            row[columns.index("price_effective_from")]: row[columns.index("input_price_per_1m")]
+            for row in rows
+        }
+
+        self.assertEqual(rates, {"2024-05-13": 5.0, "2024-08-06": 2.5})
+
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
         # claude-opus-4-5 at $5/$25 per 1M input/output tokens.
@@ -2878,6 +2939,18 @@ class AgentTokenDashboardMetadataTests(unittest.TestCase):
             ),
             2,
         )
+
+    def test_outlier_and_rate_panels_state_what_they_rest_on(self):
+        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
+        charts = metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+
+        # An outlier verdict drawn from a guessed rate would be flagging the
+        # guess, so this one reads confirmed prices only.
+        self.assertIn("is_estimated = 0", charts["outlier_calls"]["query"])
+        # The rate panel is the opposite case on purpose: a placeholder
+        # replaced by a confirmed rate is itself a pricing change, so it keeps
+        # estimated rows and carries the flag to keep the two distinct.
+        self.assertIn("r.is_estimated", charts["rate_changes"]["query"])
 
     def test_usage_canned_queries_cover_profiles(self):
         metadata = json.loads((REPO_ROOT / "metadata.json").read_text())

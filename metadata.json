@@ -157,6 +157,22 @@
             "most_expensive_calls"
           ],
           [
+            "outlier_calls",
+            "outlier_calls",
+            "outlier_calls",
+            "outlier_calls",
+            "outlier_calls",
+            "outlier_calls"
+          ],
+          [
+            "rate_changes",
+            "rate_changes",
+            "rate_changes",
+            "rate_changes",
+            "rate_changes",
+            "rate_changes"
+          ],
+          [
             "recent_calls",
             "recent_calls",
             "recent_calls",
@@ -688,6 +704,18 @@
             "title": "Most expensive calls",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT ROUND(cost_usd, 6) AS cost_usd, is_estimated, timestamp, agent, provider, model, workspace_name, profile, session_id, input_tokens, output_tokens, input_tokens + output_tokens AS total_tokens, request_id FROM priced WHERE has_price = 1 ORDER BY cost_usd DESC, datetime(timestamp) DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "library": "table"
+          },
+          "outlier_calls": {
+            "title": "Calls costing 3x their model's median (or more)",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) , confirmed AS (SELECT * FROM priced WHERE has_price = 1 AND is_estimated = 0), ranked AS (SELECT provider, model, cost_usd, timestamp, agent, workspace_name, profile, session_id, request_id, input_tokens + output_tokens AS total_tokens, ROW_NUMBER() OVER (PARTITION BY provider, model ORDER BY cost_usd) AS rn, COUNT(*) OVER (PARTITION BY provider, model) AS n FROM confirmed), medians AS (SELECT provider, model, AVG(CASE WHEN rn IN ((n + 1) / 2, (n + 2) / 2) THEN cost_usd END) AS median_cost, MAX(n) AS segment_calls FROM ranked GROUP BY provider, model) SELECT ROUND(r.cost_usd, 6) AS cost_usd, ROUND(m.median_cost, 6) AS model_median_cost_usd, ROUND(r.cost_usd / NULLIF(m.median_cost, 0), 1) AS vs_median, m.segment_calls, r.timestamp, r.agent, r.provider, r.model, r.workspace_name, r.profile, r.session_id, r.total_tokens, r.request_id FROM ranked r JOIN medians m ON m.provider = r.provider AND m.model = r.model WHERE m.segment_calls >= 5 AND COALESCE(m.median_cost, 0) > 0 AND r.cost_usd >= 3 * m.median_cost ORDER BY vs_median DESC, cost_usd DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "library": "table"
+          },
+          "rate_changes": {
+            "title": "Models billed at more than one rate in this window",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) , confirmed AS (SELECT * FROM priced WHERE has_price = 1 AND price_effective_from IS NOT NULL), rates AS (SELECT provider, model, price_effective_from, is_estimated, MAX(input_price_per_1m) AS input_price_per_1m, MAX(output_price_per_1m) AS output_price_per_1m, COUNT(*) AS calls, MIN(timestamp) AS first_call, MAX(timestamp) AS last_call, ROUND(SUM(cost_usd), 4) AS cost_usd FROM confirmed GROUP BY provider, model, price_effective_from, is_estimated), changed AS (SELECT provider, model FROM rates GROUP BY provider, model HAVING COUNT(*) > 1) SELECT r.provider, r.model, r.price_effective_from, r.is_estimated, r.input_price_per_1m, r.output_price_per_1m, r.calls, r.cost_usd, r.first_call, r.last_call FROM rates r JOIN changed c ON c.provider = r.provider AND c.model = r.model ORDER BY r.provider, r.model, r.price_effective_from ",
             "library": "table"
           },
           "recent_calls": {
