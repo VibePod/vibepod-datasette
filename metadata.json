@@ -261,7 +261,7 @@
             }
           },
           "total_cost": {
-            "title": "Total cost (real spend, metered calls)",
+            "title": "Total cost (confirmed prices)",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile)), priced AS (SELECT * FROM filtered WHERE has_usage = 1), costed AS (SELECT * FROM priced WHERE has_price = 1 AND is_estimated = 0) SELECT ROUND(COALESCE(SUM(cost_usd), 0), 4) AS total_cost FROM costed",
             "library": "metric",
@@ -271,7 +271,7 @@
             }
           },
           "total_estimated_value": {
-            "title": "Estimated value of subscription usage (not billed)",
+            "title": "Estimated cost (unconfirmed prices)",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile)), priced AS (SELECT * FROM filtered WHERE has_usage = 1), costed AS (SELECT * FROM priced WHERE has_price = 1 AND is_estimated = 1) SELECT ROUND(COALESCE(SUM(cost_usd), 0), 4) AS total_estimated_value FROM costed",
             "library": "metric",
@@ -281,7 +281,7 @@
             }
           },
           "cost_by_agent": {
-            "title": "Cost by agent (USD, real spend on metered calls)",
+            "title": "Cost by agent (USD, confirmed prices)",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile)), priced AS (SELECT * FROM filtered WHERE has_usage = 1), costed AS (SELECT * FROM priced WHERE has_price = 1 AND is_estimated = 0) SELECT agent, ROUND(SUM(cost_usd), 4) AS cost_usd, COUNT(*) AS call_count FROM costed GROUP BY agent ORDER BY cost_usd DESC",
             "library": "vega-lite",
@@ -328,7 +328,7 @@
             }
           },
           "estimated_value_by_agent": {
-            "title": "Estimated subscription value by agent (USD, not billed)",
+            "title": "Estimated cost by agent (USD, unconfirmed prices)",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile)), priced AS (SELECT * FROM filtered WHERE has_usage = 1), costed AS (SELECT * FROM priced WHERE has_price = 1 AND is_estimated = 1) SELECT agent, ROUND(SUM(cost_usd), 4) AS cost_usd, COUNT(*) AS call_count FROM costed GROUP BY agent ORDER BY cost_usd DESC",
             "library": "vega-lite",

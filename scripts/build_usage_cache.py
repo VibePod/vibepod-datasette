@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 
 -- Two de-duplication rules:
---   1. Codex subscription calls report usage on a websocket frame while their
---      HTTP twin carries none; keep the websocket row, drop the twin.
+--   1. Codex calls report usage on a websocket frame while their HTTP twin
+--      carries none; keep the websocket row, drop the twin.
 --   2. A provider can emit the same usage snapshot more than once for one
 --      logical call, which inflates totals (see ccusage issue #884). When a
 --      response id is present, keep a single row per (request_id, response_id)
@@ -173,10 +173,11 @@ WHERE (
 -- every refresh (see sync_pricing()). A row with model = '' is a per-provider
 -- catch-all: every model string is a match for the empty prefix, so it only
 -- wins when no more specific entry exists for that provider. is_estimated
--- marks rows for flat-rate subscriptions (ChatGPT/Copilot): those providers
--- are not billed per token, so their price is the metered-API-equivalent
--- rate of the underlying model, shown as a "what this would cost" estimate
--- rather than real spend.
+-- marks a rate with a vague reference -- a catch-all applied to a model that
+-- matched nothing, or a placeholder nobody has confirmed for this model. A
+-- price published for the exact model is never estimated, whichever product
+-- served the call: Codex bills at OpenAI's rates, and a Copilot call is
+-- priced at the published rate of the model it actually ran.
 --
 -- Prices change over time, so (provider, model) can have several rows with
 -- different effective_from dates instead of one fixed price; a call is
@@ -212,9 +213,9 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 -- no separate reasoning price. has_price/cost_usd are only set when
 -- has_usage = 1: a call with no parsed token counts has nothing to price,
 -- regardless of whether a matching pricing entry exists. is_estimated flags
--- cost_usd as a metered-equivalent estimate rather than real spend (see
--- model_pricing above); dashboards must sum real and estimated cost
--- separately so a flat-rate plan's estimate never inflates actual spend.
+-- cost_usd as computed from a vague price reference (see model_pricing
+-- above); dashboards must sum confirmed and estimated cost separately so a
+-- guessed rate never inflates the figure read as actual spend.
 CREATE VIEW IF NOT EXISTS agent_token_cost AS
 WITH matched AS (
     SELECT

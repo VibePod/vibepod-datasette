@@ -588,34 +588,62 @@ class AgentTokenSqlTests(unittest.TestCase):
             for row in self.conn.execute(charts["cost_by_agent"]["query"], self.PARAMS).fetchall()
         }
 
-        # The seeded codex call (r4: 700 input / 90 output tokens) counts as
-        # real spend too: Codex/Copilot here authenticate with a metered API
-        # key, not a flat-rate plan, so openai-codex is not is_estimated.
-        codex_cost = round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4)
-        self.assertAlmostEqual(total_cost, 5.0 + 25.0 + codex_cost)
+        # The seeded codex call (r4) ran model "c", which matches no pricing
+        # entry and falls back to the openai-codex catch-all: that is a guess
+        # about which model ran, so it is estimated, never confirmed cost.
+        self.assertAlmostEqual(total_cost, 5.0 + 25.0)
         self.assertAlmostEqual(by_agent["claude"], 5.0 + 25.0)
-        self.assertAlmostEqual(by_agent["codex"], codex_cost)
+        self.assertNotIn("codex", by_agent)
+
+    def test_confirmed_cost_covers_codex_and_copilot_models_by_name(self):
+        # A published rate for the exact model is confirmed cost whichever
+        # product served the call: Codex bills at OpenAI's rates, and a
+        # Copilot call is priced at the rate of the model it actually ran.
+        for rid, host, container, model in (
+            ("cx", "chatgpt.com", "vibepod-codex-abc4", "gpt-5-codex"),
+            ("cp", "api.githubcopilot.com", "vibepod-copilot-abc3", "claude-sonnet-4-5"),
+        ):
+            self._request(rid, host, "/v1/chat", container, model, ts="2026-07-26T10:00:00+00:00")
+            self._response(
+                rid,
+                json.dumps(
+                    {"model": model, "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0}},
+                ).encode(),
+            )
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        by_agent = {
+            row[0]: row[1]
+            for row in self.conn.execute(charts["cost_by_agent"]["query"], self.PARAMS).fetchall()
+        }
+
+        self.assertAlmostEqual(by_agent["codex"], 1.25)
+        self.assertAlmostEqual(by_agent["copilot"], 3.0)
 
     def test_dashboard_estimated_value_charts_cover_unverified_placeholder_models(self):
-        # claude-opus-5 has no confirmed anthropic.com/pricing figure yet, so
-        # the bundled entry is a PLACEHOLDER mirroring the opus-4-5 tier and
-        # stays is_estimated until a real source replaces it. This is the
-        # "we're guessing" bucket, kept out of total_cost/cost_by_agent.
+        # gpt-5.6-sol has no confirmed openai.com/api/pricing figure yet, so the
+        # bundled entry is a PLACEHOLDER mirroring the gpt-5 tier and stays
+        # is_estimated until a real source replaces it. This is the "we're
+        # guessing" bucket, kept out of total_cost/cost_by_agent.
         self._request(
             "r5",
-            "api.anthropic.com",
-            "/v1/messages",
-            "vibepod-claude-abc1",
-            "claude-opus-5",
-            container_id="abc1id123456",
-            # claude-opus-5's bundled price is only effective_from 2026-08-01;
+            "api.openai.com",
+            "/v1/chat/completions",
+            "vibepod-openai-plc1",
+            "gpt-5.6-sol",
+            # gpt-5.6-sol's bundled price is only effective_from 2026-08-01;
             # the seed's default timestamp (2026-07-26) predates it.
             ts="2026-08-15T10:00:00+00:00",
         )
         self._response(
             "r5",
             json.dumps(
-                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+                {
+                    "model": "gpt-5.6-sol",
+                    "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
+                },
             ).encode(),
             ts="2026-08-15T10:00:01+00:00",
         )
@@ -635,10 +663,14 @@ class AgentTokenSqlTests(unittest.TestCase):
             ).fetchall()
         }
 
-        self.assertAlmostEqual(total_estimated_value, 5.0 + 25.0)
-        self.assertAlmostEqual(by_agent["claude"], 5.0 + 25.0)
-        # codex is billed as real spend now, so it never lands here.
-        self.assertNotIn("codex", by_agent)
+        # Both kinds of vague reference land here and nowhere else: the
+        # placeholder above, and the seeded codex call priced by the
+        # openai-codex catch-all because its model matched no entry.
+        codex_catch_all = 700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000
+        placeholder = 1.25 + 10.0
+        self.assertAlmostEqual(total_estimated_value, placeholder + codex_catch_all, places=4)
+        self.assertAlmostEqual(by_agent["openai"], placeholder, places=4)
+        self.assertAlmostEqual(by_agent["codex"], codex_catch_all, places=4)
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
@@ -671,14 +703,14 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertAlmostEqual(alpha_claude[real_idx], 5.0 + 25.0)
         self.assertAlmostEqual(alpha_claude[estimated_idx], 0.0)
 
-        # The seeded codex call is real spend too: Codex here authenticates
-        # with a metered API key, not a flat-rate plan.
+        # The seeded codex call ran an unlisted model, so the catch-all prices
+        # it and the table reports it as estimated, never as confirmed cost.
         gamma_codex = rows[("gamma", "codex")]
+        self.assertAlmostEqual(gamma_codex[real_idx], 0.0)
         self.assertAlmostEqual(
-            gamma_codex[real_idx],
+            gamma_codex[estimated_idx],
             round(700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000, 4),
         )
-        self.assertAlmostEqual(gamma_codex[estimated_idx], 0.0)
 
     def test_recent_calls_includes_cost_and_estimated_flag(self):
         self._request(
@@ -695,23 +727,25 @@ class AgentTokenSqlTests(unittest.TestCase):
                 {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
             ).encode(),
         )
-        # claude-opus-5 is an unverified PLACEHOLDER price, so this row must
+        # gpt-5.6-sol is an unverified PLACEHOLDER price, so this row must
         # still surface is_estimated = 1 even though most calls now don't.
         self._request(
             "r6",
-            "api.anthropic.com",
-            "/v1/messages",
-            "vibepod-claude-abc1",
-            "claude-opus-5",
-            container_id="abc1id123456",
-            # claude-opus-5's bundled price is only effective_from 2026-08-01;
+            "api.openai.com",
+            "/v1/chat/completions",
+            "vibepod-openai-plc1",
+            "gpt-5.6-sol",
+            # gpt-5.6-sol's bundled price is only effective_from 2026-08-01;
             # the seed's default timestamp (2026-07-26) predates it.
             ts="2026-08-15T10:00:00+00:00",
         )
         self._response(
             "r6",
             json.dumps(
-                {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
+                {
+                    "model": "gpt-5.6-sol",
+                    "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
+                },
             ).encode(),
             ts="2026-08-15T10:00:01+00:00",
         )
@@ -730,9 +764,9 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertAlmostEqual(rows["claude-opus-4-5"][cost_idx], 5.0 + 25.0)
         self.assertEqual(rows["claude-opus-4-5"][estimated_idx], 0)
-        # codex is billed as real spend now (metered API key, not a plan).
-        self.assertEqual(rows["c"][estimated_idx], 0)
-        self.assertEqual(rows["claude-opus-5"][estimated_idx], 1)
+        # Priced by the openai-codex catch-all, so flagged estimated.
+        self.assertEqual(rows["c"][estimated_idx], 1)
+        self.assertEqual(rows["gpt-5.6-sol"][estimated_idx], 1)
 
     def test_cache_write_card_sums_cache_creation_tokens(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
@@ -2048,16 +2082,30 @@ class PricingTests(unittest.TestCase):
         # rate, calls on/after it price at the new rate. "Now" (whenever the
         # dashboard is viewed) must never leak into a historical call's cost.
         self._insert_price(
-            "acme", "model-a", input_price=5.0, effective_from="2024-05-13",
+            "acme",
+            "model-a",
+            input_price=5.0,
+            effective_from="2024-05-13",
         )
         self._insert_price(
-            "acme", "model-a", input_price=2.5, effective_from="2024-08-06",
+            "acme",
+            "model-a",
+            input_price=2.5,
+            effective_from="2024-08-06",
         )
         self._insert_usage(
-            1, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-06-01T00:00:00+00:00",
+            1,
+            "acme",
+            "model-a",
+            input_tokens=1_000_000,
+            timestamp="2024-06-01T00:00:00+00:00",
         )
         self._insert_usage(
-            2, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-09-01T00:00:00+00:00",
+            2,
+            "acme",
+            "model-a",
+            input_tokens=1_000_000,
+            timestamp="2024-09-01T00:00:00+00:00",
         )
 
         before_change = self._cost_row(1)
@@ -2069,7 +2117,11 @@ class PricingTests(unittest.TestCase):
     def test_call_before_any_known_price_is_unpriced(self):
         self._insert_price("acme", "model-a", input_price=2.5, effective_from="2024-08-06")
         self._insert_usage(
-            1, "acme", "model-a", input_tokens=1_000_000, timestamp="2024-01-01T00:00:00+00:00",
+            1,
+            "acme",
+            "model-a",
+            input_tokens=1_000_000,
+            timestamp="2024-01-01T00:00:00+00:00",
         )
 
         has_price, cost, _is_estimated = self._cost_row(1)
@@ -2078,11 +2130,14 @@ class PricingTests(unittest.TestCase):
         self.assertIsNone(cost)
 
     def test_provider_catch_all_prices_every_model_at_its_rate(self):
-        # A subscription catch-all is priced at the metered-equivalent rate
-        # (not $0) and flagged is_estimated so it reads as "what this would
-        # cost", not real spend.
+        # A provider catch-all still prices the call (not $0) and is flagged
+        # is_estimated, because which model ran is a guess.
         self._insert_price(
-            "acme-sub", "", input_price=2.0, output_price=8.0, is_estimated=True,
+            "acme-sub",
+            "",
+            input_price=2.0,
+            output_price=8.0,
+            is_estimated=True,
         )
         self._insert_usage(
             1,
@@ -2109,7 +2164,7 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(is_estimated, 0)
 
     def test_call_without_parsed_usage_is_never_priced(self):
-        # A subscription catch-all would otherwise price this, hiding
+        # A provider catch-all would otherwise price this, hiding
         # the fact that its actual token counts are unknown.
         self._insert_price("acme-sub", "", input_price=2.0, output_price=8.0, is_estimated=True)
         self._insert_usage(1, "acme-sub", "model-a", input_tokens=1_000_000, has_usage=0)
@@ -2219,7 +2274,7 @@ class PricingTests(unittest.TestCase):
 
         self.assertEqual(loaded, 1)
 
-    def test_bundled_pricing_file_loads_and_covers_subscription_providers(self):
+    def test_bundled_pricing_file_flags_only_vague_references_as_estimated(self):
         loaded = build_usage_cache.sync_pricing(self.conn, build_usage_cache.default_pricing_path())
 
         self.assertGreater(loaded, 0)
@@ -2229,15 +2284,40 @@ class PricingTests(unittest.TestCase):
         }
         self.assertIn("openai-codex", providers)
         self.assertIn("github-copilot", providers)
-        # Codex/Copilot here authenticate with a metered API key, not a
-        # flat-rate plan, so the catch-all carries a real per-token rate and
-        # is not flagged is_estimated.
-        catch_all = self.conn.execute(
-            "SELECT input_price_per_1m, is_estimated FROM model_pricing "
-            "WHERE provider = 'openai-codex' AND model = ''",
-        ).fetchone()
-        self.assertGreater(catch_all[0], 0)
-        self.assertEqual(catch_all[1], 0)
+
+        # A rate published for the exact model is confirmed, whichever product
+        # served the call.
+        for provider, model in (
+            ("openai-codex", "gpt-5-codex"),
+            ("github-copilot", "claude-sonnet-4-5"),
+        ):
+            with self.subTest(provider=provider):
+                price, estimated = self.conn.execute(
+                    "SELECT input_price_per_1m, is_estimated FROM model_pricing "
+                    "WHERE provider = ? AND model = ?",
+                    (provider, model),
+                ).fetchone()
+                self.assertGreater(price, 0)
+                self.assertEqual(estimated, 0)
+
+        # The two vague references: a catch-all applied to a model that matched
+        # nothing, and a placeholder rate nobody has confirmed for that model.
+        vague = self.conn.execute(
+            "SELECT provider, model, is_estimated, price_source FROM model_pricing "
+            "WHERE model = '' OR price_source LIKE 'PLACEHOLDER%'",
+        ).fetchall()
+        self.assertGreater(len(vague), 0)
+        for provider, model, estimated, source in vague:
+            with self.subTest(provider=provider, model=model):
+                self.assertEqual(estimated, 1, source)
+
+        # Nothing else may be flagged: an unexplained estimate is exactly what
+        # this rule exists to prevent.
+        unexplained = self.conn.execute(
+            "SELECT provider, model FROM model_pricing WHERE is_estimated = 1 "
+            "AND model != '' AND price_source NOT LIKE 'PLACEHOLDER%'",
+        ).fetchall()
+        self.assertEqual(unexplained, [])
 
 
 class AgentTokenDashboardMetadataTests(unittest.TestCase):
