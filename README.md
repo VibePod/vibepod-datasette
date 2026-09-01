@@ -71,6 +71,7 @@ It includes:
 - tokens by agent and model table, including cached, cache-write, and cost columns
 - tokens by workspace and agent table
 - tokens and cost by profile and agent table
+- tokens and cost by session table, plus a count of active sessions
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
@@ -185,6 +186,26 @@ to the session), and a `logs.db` whose `sessions` has none simply resolves no pr
 profile panels on the **HTTP Requests** and **Agent Sessions** dashboards read those source
 columns directly, so they need a proxy and a CLI new enough to write them; the token
 dashboards do not, because they read the cache.
+
+### How calls are attributed to a session
+
+The session is the run an agent was doing when it made the call — one `vp run`, one row in
+`logs.db`'s `sessions` table. It answers "what did *this* run cost", which is the question
+behind an unexpected bill: a workspace total says which project, a session total says which run.
+
+`proxy.db` has no session column, so the session id is resolved exactly like the workspace, from
+the same `session_windows` snapshot and the same container match. One extra rule applies, because
+a container id names a *container*, not a session, and a container can host more than one (re-
+attaching opens another): among the sessions of the matched container, the call is attributed to
+the one that started last on or before the call's own timestamp. A call older than every session
+of that container keeps the earliest one rather than going unattributed.
+
+A call whose container has no session row at all is counted under `unknown`, so per-session
+totals still add up to the overall total, and the refresh logs `session resolution: resolved=…,
+unknown=…, pending=…` beside the workspace and profile lines. `session_token_totals`
+(`/-/queries/usage/session_token_totals`) reports calls, tokens, and confirmed/estimated cost per
+session with its agent, workspace and profile; `session_resolution` breaks resolved and still
+pending rows down per container.
 
 ### Why there is a usage cache
 

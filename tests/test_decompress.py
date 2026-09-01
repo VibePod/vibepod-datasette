@@ -551,6 +551,7 @@ class AgentTokenSqlTests(unittest.TestCase):
                 "calls_with_usage": " calls",
                 "active_workspaces": " workspaces",
                 "active_profiles": " profiles",
+                "active_sessions": " sessions",
             }
             with self.subTest(chart=name):
                 self.assertEqual(chart["display"]["suffix"], counted.get(name, " tok"))
@@ -1713,30 +1714,116 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertNotIn("", [v for pair in rows for v in pair])
 
+    def _window(self, container_id12, name, workspace, profile, session_id, started_at):
+        return build_usage_cache.SessionWindow(
+            container_id12=container_id12,
+            container_name=name,
+            workspace=workspace,
+            workspace_name=Path(workspace).name,
+            profile=profile,
+            session_id=session_id,
+            started_at=started_at,
+        )
+
     def test_resolve_session_unit(self):
-        alpha = ("abc1id123456", "vibepod-claude-abc1", "/hs/alpha", "alpha", "work")
         windows = [
-            (*alpha, "2026-07-25T10:00:00+00:00"),
-            (
+            self._window(
+                "abc1id123456",
+                "vibepod-claude-abc1",
+                "/hs/alpha",
+                "work",
+                "sess-alpha",
+                "2026-07-25T10:00:00+00:00",
+            ),
+            self._window(
                 "xbc1idzzzzzz",
                 "vibepod-clone",
                 "/hs/clone",
-                "clone",
                 "personal",
+                "sess-clone",
                 "2026-07-25T10:00:00+00:00",
             ),
         ]
         ts = build_usage_cache._parse_ts("2026-07-26T10:00:00+00:00")
-        by_id = build_usage_cache.resolve_session("abc1id123456", "vibepod-other", ts, windows)
-        self.assertEqual(by_id, ("/hs/alpha", "alpha", "work", "by_id"))
-        by_name = build_usage_cache.resolve_session("", "vibepod-clone", ts, windows)
-        self.assertEqual(by_name, ("/hs/clone", "clone", "personal", "by_name"))
+
+        window, path = build_usage_cache.resolve_session(
+            "abc1id123456",
+            "vibepod-other",
+            ts,
+            windows,
+        )
+        self.assertEqual(
+            (window.workspace, window.profile, window.session_id),
+            ("/hs/alpha", "work", "sess-alpha"),
+        )
+        self.assertEqual(path, "by_id")
+
+        window, path = build_usage_cache.resolve_session("", "vibepod-clone", ts, windows)
+        self.assertEqual((window.workspace, window.session_id), ("/hs/clone", "sess-clone"))
+        self.assertEqual(path, "by_name")
+
         # An id that matches no session still falls back to the name.
-        stale_id = build_usage_cache.resolve_session("zzz1idxxxxxx", "vibepod-clone", ts, windows)
-        self.assertEqual(stale_id, ("/hs/clone", "clone", "personal", "by_name"))
+        window, path = build_usage_cache.resolve_session(
+            "zzz1idxxxxxx",
+            "vibepod-clone",
+            ts,
+            windows,
+        )
+        self.assertEqual(window.session_id, "sess-clone")
+        self.assertEqual(path, "by_name")
+
         self.assertIsNone(build_usage_cache.resolve_session("", "vibepod-nope", ts, windows))
         self.assertIsNone(
             build_usage_cache.resolve_session("abc1idxxxxxx", "vibepod-nope", ts, windows),
+        )
+
+    def test_resolve_session_picks_the_session_the_call_belongs_to(self):
+        # One container can host several sessions (re-attaching opens another),
+        # so the id alone names the container, not the session; the call's own
+        # time has to choose between them.
+        windows = [
+            self._window(
+                "dup1id000001",
+                "vibepod-dup-1",
+                "/hs/dup",
+                "work",
+                "sess-first",
+                "2026-07-25T10:00:00+00:00",
+            ),
+            self._window(
+                "dup1id000001",
+                "vibepod-dup-1",
+                "/hs/dup",
+                "work",
+                "sess-second",
+                "2026-07-26T10:00:00+00:00",
+            ),
+        ]
+
+        during_first = build_usage_cache._parse_ts("2026-07-25T18:00:00+00:00")
+        during_second = build_usage_cache._parse_ts("2026-07-26T18:00:00+00:00")
+        before_any = build_usage_cache._parse_ts("2026-07-01T10:00:00+00:00")
+
+        self.assertEqual(
+            build_usage_cache.resolve_session("dup1id000001", "x", during_first, windows)[
+                0
+            ].session_id,
+            "sess-first",
+        )
+        self.assertEqual(
+            build_usage_cache.resolve_session("dup1id000001", "x", during_second, windows)[
+                0
+            ].session_id,
+            "sess-second",
+        )
+        # A call older than every session of that container is still that
+        # container's traffic, so it keeps the earliest rather than going
+        # unattributed.
+        self.assertEqual(
+            build_usage_cache.resolve_session("dup1id000001", "x", before_any, windows)[
+                0
+            ].session_id,
+            "sess-first",
         )
 
     def test_resolution_beats_the_grace_decision(self):
@@ -1766,6 +1853,99 @@ class AgentTokenSqlTests(unittest.TestCase):
     def _profiles(self):
         sql = self.metadata["databases"]["usage"]["queries"]["profile_token_totals"]["sql"]
         return {row[0]: row for row in self.conn.execute(sql, self.PARAMS).fetchall()}
+
+    def _stored_session(self, request_id):
+        """The raw, un-normalized session id of a row ('' while still pending)."""
+        return self.conn.execute(
+            "SELECT session_id FROM token_usage WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0]
+
+    def _sessions(self):
+        sql = self.metadata["databases"]["usage"]["queries"]["session_token_totals"]["sql"]
+        return {row[0]: row for row in self.conn.execute(sql, self.PARAMS).fetchall()}
+
+    def test_calls_are_attributed_to_the_session_of_their_container(self):
+        # The seeds resolve by container id; the session id is what makes
+        # per-session totals possible at all, since proxy.db never sees it.
+        self.assertEqual(self._stored_session("r1"), "sess-abc1id123456")
+        self.assertEqual(self._stored_session("r2"), "sess-abc2id123456")
+
+    def test_session_totals_aggregate_every_call_of_one_session(self):
+        totals = self._sessions()
+
+        # r1: 1200 input (900 of it cached) + 300 output, one call.
+        row = totals["sess-abc1id123456"]
+        self.assertEqual(row[4], 1)
+        self.assertEqual(row[11], 1500)
+        self.assertEqual(row[1], "claude")
+        self.assertEqual(row[2], "alpha")
+
+    def test_calls_without_a_session_are_counted_under_unknown(self):
+        # The copilot seed has no session row: it must stay in the totals as
+        # 'unknown' rather than vanishing from per-session reporting.
+        shown = self.conn.execute(
+            "SELECT session_id FROM agent_token_usage WHERE request_id = 'r3'",
+        ).fetchone()[0]
+
+        self.assertEqual(self._stored_session("r3"), "")
+        self.assertEqual(shown, "unknown")
+
+        build_usage_cache.sync_sessions(self.logs_path, self.conn, grace_seconds=0)
+
+        self.assertEqual(self._stored_session("r3"), "unknown")
+
+    def test_session_resolution_survives_a_second_session_on_one_container(self):
+        # Re-attaching opens a second session on the same container; calls must
+        # land on the session that was running when they were made.
+        self._session(
+            "seq1id000001",
+            "vibepod-seq-1",
+            "/home/g/projects/seq",
+            "2026-07-25T10:00:00+00:00",
+            session_id="sess-early",
+        )
+        self._session(
+            "seq1id000001",
+            "vibepod-seq-1",
+            "/home/g/projects/seq",
+            "2026-07-27T10:00:00+00:00",
+            session_id="sess-late",
+        )
+        for rid, ts in (("sq1", "2026-07-26T10:00:00+00:00"), ("sq2", "2026-07-28T10:00:00+00:00")):
+            self._request(
+                rid,
+                "api.groq.com",
+                "/v1/chat",
+                "vibepod-seq-1",
+                "l3",
+                container_id="seq1id000001",
+                ts=ts,
+            )
+            self._response(rid, json.dumps({"usage": {"prompt_tokens": 5}}).encode(), ts=ts)
+        self.source.commit()
+        self.refresh()
+
+        self.assertEqual(self._stored_session("sq1"), "sess-early")
+        self.assertEqual(self._stored_session("sq2"), "sess-late")
+
+    def test_session_resolution_diagnostic_lists_containers(self):
+        sql = self.metadata["databases"]["usage"]["queries"]["session_resolution"]["sql"]
+
+        rows = self.conn.execute(sql).fetchall()
+
+        self.assertIn("sess-abc1id123456", {row[2] for row in rows})
+
+    def test_session_totals_and_workspace_totals_agree(self):
+        # Both are cuts of the same rows, so the same call cannot be counted in
+        # one and missing from the other.
+        sessions = self._sessions()
+        workspaces = self._workspace()
+
+        self.assertEqual(
+            sum(row[11] for row in sessions.values()),
+            sum(row[8] for row in workspaces.values()),
+        )
 
     def test_profile_recorded_by_the_proxy_wins_over_the_session(self):
         # The request row is the profile the proxy actually filtered under; a

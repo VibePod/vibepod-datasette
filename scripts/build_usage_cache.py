@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -40,7 +41,7 @@ except ImportError:  # pragma: no cover - exercised via the container image
 # tables/views and rebuilds them, because old rows/columns cannot be upgraded
 # in place. model_pricing is cheap to drop: it holds no captured data, only a
 # full reload of pricing/model_prices.json on the next refresh.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS token_usage (
     container_id       TEXT NOT NULL DEFAULT '',
     container_name     TEXT NOT NULL DEFAULT '',
     profile            TEXT NOT NULL DEFAULT '',
+    session_id         TEXT NOT NULL DEFAULT '',
     workspace          TEXT NOT NULL DEFAULT '',
     workspace_name     TEXT NOT NULL DEFAULT '',
     -- When this row was written, which is what the resolution grace period
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS session_windows (
     workspace        TEXT NOT NULL,
     workspace_name   TEXT NOT NULL,
     profile          TEXT NOT NULL DEFAULT '',
+    session_id       TEXT NOT NULL DEFAULT '',
     started_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_windows_id ON session_windows(container_id12);
@@ -95,6 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_session_windows_name ON session_windows(container
 CREATE INDEX IF NOT EXISTS idx_token_usage_pending ON token_usage(workspace) WHERE workspace = '';
 CREATE INDEX IF NOT EXISTS idx_token_usage_pending_profile ON token_usage(profile)
     WHERE profile = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_pending_session ON token_usage(session_id)
+    WHERE session_id = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage(agent);
@@ -141,6 +147,10 @@ SELECT
         WHEN t.profile = '' THEN 'unknown'
         ELSE t.profile
     END AS profile,
+    CASE
+        WHEN t.session_id = '' THEN 'unknown'
+        ELSE t.session_id
+    END AS session_id,
     CASE
         WHEN t.workspace = '' THEN 'unknown'
         ELSE t.workspace
@@ -432,6 +442,9 @@ def _row_values(
         # The proxy records the profile on the request itself; when it did not,
         # the resolution pass fills it in from the container's session.
         profile or "",
+        # Session id only exists in logs.db, so it is resolved after ingest
+        # alongside the workspace.
+        "",
         # Workspace is resolved in the dedicated pass after ingest, because the
         # session row may only appear in logs.db after the call was captured.
         "",
@@ -443,9 +456,9 @@ def _row_values(
 INSERT_SQL = (
     "INSERT INTO token_usage (source, row_id, request_id, response_id, timestamp, agent, "
     "provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, "
-    "reasoning_tokens, has_usage, container_id, container_name, profile, workspace, "
-    "workspace_name, ingested_at) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "reasoning_tokens, has_usage, container_id, container_name, profile, session_id, "
+    "workspace, workspace_name, ingested_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT(source, row_id) DO NOTHING"
 )
 
@@ -550,52 +563,74 @@ def _parse_ts(value: str) -> datetime | None:
     return parsed
 
 
-def resolve_session(container_id12: str, container_name: str, ts, windows):
-    """Match a call to its container's session: exact id first, name fallback.
+class SessionWindow(NamedTuple):
+    """One logs.db session row, as the resolver sees it."""
 
-    The id match needs no time logic, because Docker container ids are never
-    reused. The name fallback covers rows the proxy captured without an id and
-    rows whose id matches no session at all (logs.db pruned, or a session that
-    predates the id column); there the newest session that started before the
-    call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
-    after session end from the same container still inherits that container's
-    workspace and profile. Returns (workspace, workspace_name, profile,
-    resolution_path) or None.
-    """
-    for id12, _name, workspace, workspace_name, profile, _started_at in windows:
-        if id12 and id12 == container_id12:
-            return (workspace, workspace_name, profile, "by_id")
-    best = None  # newest session started before the call
+    container_id12: str
+    container_name: str
+    workspace: str
+    workspace_name: str
+    profile: str
+    session_id: str
+    started_at: str
+
+
+def _newest_before(windows, ts):
+    """The candidate that started last on or before the call, or None."""
+    best = None
     best_started = None
-    for _id12, name, workspace, workspace_name, profile, started_at in windows:
-        if name != container_name:
-            continue
-        started = _parse_ts(started_at)
+    for window in windows:
+        started = _parse_ts(window.started_at)
         if started is None:
             continue
         if ts is not None and started > ts:
             continue
         if best_started is None or started > best_started:
-            best, best_started = (workspace, workspace_name, profile), started
-    if best is None:
+            best, best_started = window, started
+    return best
+
+
+def resolve_session(container_id12: str, container_name: str, ts, windows):
+    """Match a call to its container's session: exact id first, name fallback.
+
+    Container ids are never reused, so an id match is always the right
+    container -- but not necessarily the right session, because a container can
+    host several (re-attaching opens another one). The call's own timestamp
+    picks between them, and if it predates every session of that container the
+    earliest one still claims it rather than dropping the call.
+
+    The name fallback covers rows the proxy captured without an id and rows
+    whose id matches no session at all (logs.db pruned, or a session that
+    predates the id column); there the newest session that started before the
+    call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
+    after session end from the same container still inherits that container's
+    workspace, profile and session. Returns (SessionWindow, resolution_path)
+    or None.
+    """
+    by_id = [w for w in windows if w.container_id12 and w.container_id12 == container_id12]
+    if by_id:
+        return (_newest_before(by_id, ts) or by_id[0], "by_id")
+    by_name = [w for w in windows if w.container_name == container_name]
+    match = _newest_before(by_name, ts)
+    if match is None:
         return None
-    return (*best, "by_name")
+    return (match, "by_name")
 
 
 def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
     """Refresh session_windows, then resolve every pending token_usage row.
 
-    A row is pending while its workspace or its profile is still empty. Rows
-    that fail resolution AND were ingested longer ago than the grace period are
-    decided 'unknown' once, so they do not get rescanned on every refresh.
-    Recently ingested rows stay pending so a session row arriving in logs.db
-    later still resolves them.
+    A row is pending while its workspace, profile or session id is still empty.
+    Rows that fail resolution AND were ingested longer ago than the grace
+    period are decided 'unknown' once, so they do not get rescanned on every
+    refresh. Recently ingested rows stay pending so a session row arriving in
+    logs.db later still resolves them.
 
-    Workspace is only ever known from the session. Profile is normally recorded
-    on the request by the proxy, and that value always wins -- the session is
-    the fallback for calls captured before the proxy logged profiles, or by a
-    proxy that does not.
-    Returns {"workspace": counts, "profile": counts} for the log lines.
+    Workspace and session id are only ever known from the session. Profile is
+    normally recorded on the request by the proxy, and that value always wins
+    -- the session is the fallback for calls captured before the proxy logged
+    profiles, or by a proxy that does not.
+    Returns per-attribute counts for the log lines.
     """
     if not logs_path.exists() or not table_exists(cache, "session_windows"):
         return None
@@ -605,47 +640,54 @@ def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRAC
             return None
         rows = logs.execute(
             "SELECT container_id, container_name, workspace, "
-            f"{profile_expr(logs, 'sessions', 'sessions')}, started_at FROM sessions",
+            f"{profile_expr(logs, 'sessions', 'sessions')}, id, started_at FROM sessions",
         ).fetchall()
     finally:
         logs.close()
     windows = tuple(
-        (
-            (row[0] or "")[:12],
-            row[1] or "",
-            row[2] or "",
-            Path(row[2] or "").name or row[2] or "",
-            row[3] or "",
-            row[4] or "",
+        SessionWindow(
+            container_id12=(row[0] or "")[:12],
+            container_name=row[1] or "",
+            workspace=row[2] or "",
+            workspace_name=Path(row[2] or "").name or row[2] or "",
+            profile=row[3] or "",
+            session_id=row[4] or "",
+            started_at=row[5] or "",
         )
         for row in rows
     )
     cache.execute("DELETE FROM session_windows")
     cache.executemany(
         "INSERT INTO session_windows (container_id12, container_name, workspace, "
-        "workspace_name, profile, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "workspace_name, profile, session_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         windows,
     )
     pending = cache.execute(
         "SELECT source, row_id, container_id, container_name, timestamp, ingested_at, "
-        "workspace, profile FROM token_usage WHERE workspace = '' OR profile = ''",
+        "workspace, profile, session_id FROM token_usage "
+        "WHERE workspace = '' OR profile = '' OR session_id = ''",
     ).fetchall()
     deadline = datetime.now(UTC) - timedelta(seconds=grace_seconds)
     workspace_updates = []
     profile_updates = []
+    session_updates = []
     counts = {"by_id": 0, "by_name": 0, "unknown": 0, "pending": 0}
     profile_counts = {"by_session": 0, "unknown": 0, "pending": 0}
-    for source, row_id, id12, name, ts, ingested_at, workspace_now, profile_now in pending:
+    session_counts = {"resolved": 0, "unknown": 0, "pending": 0}
+    for row in pending:
+        (source, row_id, id12, name, ts, ingested_at, workspace_now, profile_now, session_now) = row
         resolved = resolve_session(id12, name, _parse_ts(ts), windows)
+        window, path = resolved if resolved is not None else (None, None)
         # An unparseable ingest stamp must still age out, otherwise the row is
         # rescanned on every refresh forever.
         ingested = _parse_ts(ingested_at)
         aged_out = ingested is None or ingested <= deadline
         if workspace_now == "":
-            if resolved is not None:
-                (workspace, workspace_name, _profile, path) = resolved
+            if window is not None:
                 counts[path] += 1
-                workspace_updates.append((workspace, workspace_name, source, row_id))
+                workspace_updates.append(
+                    (window.workspace, window.workspace_name, source, row_id),
+                )
             elif aged_out:
                 counts["unknown"] += 1
                 workspace_updates.append(("unknown", "unknown", source, row_id))
@@ -654,7 +696,7 @@ def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRAC
         if profile_now == "":
             # A session without a profile resolves nothing here: it ages out to
             # 'unknown' like a call with no session at all.
-            session_profile = resolved[2] if resolved is not None else ""
+            session_profile = window.profile if window is not None else ""
             if session_profile:
                 profile_counts["by_session"] += 1
                 profile_updates.append((session_profile, source, row_id))
@@ -663,6 +705,19 @@ def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRAC
                 profile_updates.append(("unknown", source, row_id))
             else:
                 profile_counts["pending"] += 1
+        if session_now == "":
+            # Same contract as the workspace: a call the proxy captured from a
+            # container with no session row is attributed to 'unknown' rather
+            # than dropped, so per-session totals still add up to the whole.
+            session_id = window.session_id if window is not None else ""
+            if session_id:
+                session_counts["resolved"] += 1
+                session_updates.append((session_id, source, row_id))
+            elif aged_out:
+                session_counts["unknown"] += 1
+                session_updates.append(("unknown", source, row_id))
+            else:
+                session_counts["pending"] += 1
     if workspace_updates:
         cache.executemany(
             "UPDATE token_usage SET workspace = ?, workspace_name = ? "
@@ -674,14 +729,20 @@ def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRAC
             "UPDATE token_usage SET profile = ? WHERE source = ? AND row_id = ?",
             profile_updates,
         )
+    if session_updates:
+        cache.executemany(
+            "UPDATE token_usage SET session_id = ? WHERE source = ? AND row_id = ?",
+            session_updates,
+        )
     cache.commit()
-    return {"workspace": counts, "profile": profile_counts}
+    return {"workspace": counts, "profile": profile_counts, "session": session_counts}
 
 
 def _log_resolution_counts(counts) -> None:
     if counts is None:
         return
-    for label, bucket in (("workspace", counts["workspace"]), ("profile", counts["profile"])):
+    for label in ("workspace", "profile", "session"):
+        bucket = counts[label]
         print(
             f"{label} resolution: " + ", ".join(f"{k}={v}" for k, v in bucket.items()),
             flush=True,

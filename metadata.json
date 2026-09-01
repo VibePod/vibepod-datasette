@@ -109,6 +109,14 @@
             "tokens_by_profile_agent"
           ],
           [
+            "tokens_by_session",
+            "tokens_by_session",
+            "tokens_by_session",
+            "tokens_by_session",
+            "active_sessions",
+            "active_sessions"
+          ],
+          [
             "tokens_by_agent_model",
             "tokens_by_agent_model",
             "tokens_by_agent_model",
@@ -924,6 +932,22 @@
             "title": "Tokens and cost by profile and agent",
             "db": "usage",
             "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT profile, agent, COUNT(*) AS call_count, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END), 4) AS real_cost_usd, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 1 THEN cost_usd ELSE 0 END), 4) AS estimated_cost_usd, SUM(has_price) AS priced_calls, SUM(1 - has_price) AS unpriced_calls FROM priced GROUP BY profile, agent ORDER BY total_tokens DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
+            "library": "table"
+          },
+          "active_sessions": {
+            "title": "Active sessions",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT COUNT(DISTINCT session_id) AS active_sessions FROM priced",
+            "library": "metric",
+            "display": {
+              "field": "active_sessions",
+              "suffix": " sessions"
+            }
+          },
+          "tokens_by_session": {
+            "title": "Tokens and cost by session",
+            "db": "usage",
+            "query": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT session_id, MAX(agent) AS agent, MAX(workspace_name) AS workspace, MAX(profile) AS profile, COUNT(*) AS calls, MIN(timestamp) AS first_call, MAX(timestamp) AS last_call, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(input_tokens + output_tokens) AS total_tokens, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END), 4) AS confirmed_cost_usd, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 1 THEN cost_usd ELSE 0 END), 4) AS estimated_cost_usd FROM priced GROUP BY session_id ORDER BY total_tokens DESC LIMIT CAST(COALESCE(:request_limit, 100) AS INTEGER)",
             "library": "table"
           }
         }
@@ -1767,6 +1791,10 @@
           "name": "Tokens per profile",
           "sql": "WITH filtered AS (SELECT * FROM agent_token_usage WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT profile, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, SUM(input_tokens + output_tokens) AS total_tokens FROM priced GROUP BY profile ORDER BY total_tokens DESC"
         },
+        "session_token_totals": {
+          "name": "Tokens per session",
+          "sql": "WITH filtered AS (SELECT * FROM agent_token_cost WHERE (COALESCE(:time_range, '24h') = 'all' OR datetime(timestamp) >= datetime('now', CASE COALESCE(:time_range, '24h') WHEN '1h' THEN '-1 hours' WHEN '2h' THEN '-2 hours' WHEN '4h' THEN '-4 hours' WHEN '24h' THEN '-24 hours' WHEN '7d' THEN '-7 days' WHEN '30d' THEN '-30 days' WHEN '3m' THEN '-90 days' WHEN '6m' THEN '-180 days' WHEN '1y' THEN '-365 days' ELSE '-24 hours' END)) AND (COALESCE(:agent, 'all') = 'all' OR agent = :agent) AND (COALESCE(:provider, 'all') = 'all' OR provider = :provider) AND (COALESCE(:host, 'all') = 'all' OR host = :host) AND (COALESCE(:workspace, 'all') = 'all' OR workspace = :workspace) AND (COALESCE(:profile, 'all') = 'all' OR profile = :profile) AND (COALESCE(:model, 'all') = 'all' OR model = :model)), priced AS (SELECT * FROM filtered WHERE has_usage = 1) SELECT session_id, MAX(agent) AS agent, MAX(workspace_name) AS workspace, MAX(profile) AS profile, COUNT(*) AS calls, MIN(timestamp) AS first_call, MAX(timestamp) AS last_call, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(input_tokens + output_tokens) AS total_tokens, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 0 THEN cost_usd ELSE 0 END), 4) AS confirmed_cost_usd, ROUND(SUM(CASE WHEN has_price = 1 AND is_estimated = 1 THEN cost_usd ELSE 0 END), 4) AS estimated_cost_usd FROM priced GROUP BY session_id ORDER BY total_tokens DESC "
+        },
         "workspace_resolution": {
           "name": "Workspace resolution diagnostics",
           "sql": "SELECT container_id, container_name, workspace, workspace_name, COUNT(*) AS resolved_rows FROM token_usage WHERE workspace != '' GROUP BY container_id, container_name, workspace, workspace_name UNION ALL SELECT container_id, container_name, 'unknown-pending', '', COUNT(*) FROM token_usage WHERE workspace = '' GROUP BY container_id, container_name ORDER BY resolved_rows DESC"
@@ -1774,6 +1802,10 @@
         "profile_resolution": {
           "name": "Profile resolution diagnostics",
           "sql": "SELECT container_id, container_name, profile, COUNT(*) AS resolved_rows FROM token_usage WHERE profile != '' GROUP BY container_id, container_name, profile UNION ALL SELECT container_id, container_name, 'unknown-pending', COUNT(*) FROM token_usage WHERE profile = '' GROUP BY container_id, container_name ORDER BY resolved_rows DESC"
+        },
+        "session_resolution": {
+          "name": "Session resolution diagnostics",
+          "sql": "SELECT container_id, container_name, session_id, COUNT(*) AS resolved_rows FROM token_usage WHERE session_id != '' GROUP BY container_id, container_name, session_id UNION ALL SELECT container_id, container_name, 'unknown-pending', COUNT(*) FROM token_usage WHERE session_id = '' GROUP BY container_id, container_name ORDER BY resolved_rows DESC"
         },
         "pricing_coverage": {
           "name": "Pricing coverage by provider and model",
