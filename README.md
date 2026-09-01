@@ -9,7 +9,6 @@ Datasette container for browsing both VibePod SQLite databases:
 - built-in HTTP observability dashboard via `datasette-dashboards` at `/-/dashboards/http-requests`
 - agent sessions dashboard via `datasette-dashboards` at `/-/dashboards/agent-sessions`
 - agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
-- dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
 - `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
   attributed to the workspace and the proxy profile each call came from via `logs.db`
 - token usage is priced from a bundled pricing dataset (`pricing/model_prices.json`), exposed
@@ -361,35 +360,6 @@ report an error, the rest of the dashboard is unaffected.
 
 If the dashboard reports that `http_requests` is missing, start VibePod traffic capture first (the proxy DB schema is created by `vibepod-proxy` once traffic is recorded).
 
-## Codex Token Dashboard
-
-> Superseded by the All Agents Token Usage dashboard, which covers Codex alongside every other agent. Kept for now and listed last on the dashboards index.
-
-Open `http://localhost:8001/-/dashboards/codex-tokens` to view token and model usage for Codex traffic proxied through `chatgpt.com` and `api.openai.com`.
-
-It includes:
-
-- total API calls
-- total input and output tokens
-- cached input token totals
-- reasoning token totals
-- token trend over time
-- model and endpoint breakdowns
-- websocket message volume and direction trend
-- recent websocket-message table (with message type + content preview)
-- recent-call table with per-request token fields
-
-Available dashboard filters:
-
-- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `all`)
-- trend bucket (`auto`, `hour`, `day`)
-- model
-- container
-- endpoint (`backend_codex`, `backend_codex_ws`, `responses`, `chat_completions`)
-- request row limit
-
-The dashboard only includes requests attributed to the `codex` agent from `source_container_name`.
-
 ## Agent Sessions Dashboard
 
 Open `http://localhost:8001/-/dashboards/agent-sessions` to view session and message usage by agent over time. It is built on the `logs` database (`sessions` and `messages` tables).
@@ -445,7 +415,9 @@ Agent identity is derived from `http_requests.source_container_name` (e.g. `vibe
 
 ## Codex Websocket Discovery Queries
 
-Use these proxy canned queries to inspect websocket payload structure and validate token calculations:
+Codex reports token usage on a websocket frame rather than in the HTTP response, which is what
+`scripts/build_usage_cache.py` reads. Use these proxy canned queries to inspect that payload
+structure and validate the token calculations against it:
 
 - `codex_ws_recent_messages`
 - `codex_ws_message_type_counts`

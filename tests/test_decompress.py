@@ -2546,16 +2546,18 @@ class AgentTokenDashboardMetadataTests(unittest.TestCase):
                 )
                 self.assertNotIn("extract_usage(", chart["query"])
 
-    def test_agent_tokens_is_listed_first_and_legacy_dashboards_last(self):
+    def test_agent_tokens_is_listed_first_and_supersedes_the_per_agent_ones(self):
         metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
 
         # datasette-dashboards renders the index in metadata key order, so this
-        # ordering is what users see. claude-tokens/codex-tokens are superseded
-        # by agent-tokens and sit at the bottom pending deprecation.
+        # ordering is what users see. The per-agent claude-tokens/codex-tokens
+        # dashboards were removed: agent-tokens covers both, from the usage
+        # cache rather than by parsing bodies on every render.
         order = list(metadata["plugins"]["datasette-dashboards"])
 
         self.assertEqual(order[0], "agent-tokens")
-        self.assertEqual(order[-2:], ["claude-tokens", "codex-tokens"])
+        self.assertNotIn("claude-tokens", order)
+        self.assertNotIn("codex-tokens", order)
 
     def test_readme_documents_the_dashboard(self):
         readme = (REPO_ROOT / "README.md").read_text()
@@ -2640,27 +2642,6 @@ class RuntimeDefaultTests(unittest.TestCase):
 
 
 class DashboardMetadataTests(unittest.TestCase):
-    def test_codex_dashboard_includes_websocket_panels(self):
-        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
-        codex = metadata["plugins"]["datasette-dashboards"]["codex-tokens"]
-
-        self.assertIn("backend_codex_ws", codex["filters"]["api_shape"]["options"])
-
-        expected_charts = (
-            "total_websocket_messages",
-            "websocket_direction_trend",
-            "recent_websocket_messages",
-        )
-        for chart in expected_charts:
-            self.assertIn(chart, codex["charts"])
-            self.assertIn("websocket_messages ws", codex["charts"][chart]["query"])
-            self.assertIn("/backend-api/codex/%", codex["charts"][chart]["query"])
-
-        # Keep codex dashboard grid complete (3 columns per row) and place
-        # the websocket metric in the former avg-tokens slot.
-        self.assertTrue(all(len(row) == 3 for row in codex["layout"]))
-        self.assertEqual(codex["layout"][1][2], "total_websocket_messages")
-
     def test_proxy_canned_queries_include_codex_websocket_discovery(self):
         metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
         proxy_queries = metadata["databases"]["proxy"]["queries"]
@@ -2676,38 +2657,6 @@ class DashboardMetadataTests(unittest.TestCase):
             self.assertIn(query_name, proxy_queries)
             self.assertIn("websocket_messages ws", proxy_queries[query_name]["sql"])
             self.assertIn("/backend-api/codex/%", proxy_queries[query_name]["sql"])
-
-    def test_codex_dashboard_uses_ws_completed_with_http_fallback(self):
-        metadata = json.loads((REPO_ROOT / "metadata.json").read_text())
-        codex = metadata["plugins"]["datasette-dashboards"]["codex-tokens"]
-
-        token_chart_queries = (
-            "total_calls",
-            "total_input_tokens",
-            "total_output_tokens",
-            "total_cached_tokens",
-            "total_reasoning_tokens",
-            "token_trend",
-            "model_breakdown",
-            "recent_calls",
-        )
-
-        for chart in token_chart_queries:
-            query = codex["charts"][chart]["query"]
-
-            self.assertIn("ws_calls AS", query)
-            self.assertIn("http_calls AS", query)
-            self.assertIn("FROM websocket_messages ws", query)
-            self.assertIn("= 'response.completed'", query)
-            self.assertIn("r.path LIKE '/backend-api/codex/%'", query)
-            self.assertIn("r.path LIKE '/backend-api/codex/responses%'", query)
-
-            # HTTP is kept as fallback but excluded when websocket completion exists.
-            self.assertIn("NOT (", query)
-            self.assertIn("EXISTS (", query)
-            self.assertIn("ws2.request_id = r.id", query)
-
-        self.assertNotIn("avg_tokens_per_call", codex["charts"])
 
 
 if __name__ == "__main__":
