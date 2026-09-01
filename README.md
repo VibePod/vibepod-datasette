@@ -64,6 +64,8 @@ It includes:
 - cost over time, confirmed vs estimated, at the selected bucket, plus a card comparing
   confirmed cost with the previous window of the same length (see "Cost over time" below)
 - average, median and p95 cost per call (confirmed prices; see "Cost per call" below)
+- top-cost-drivers table ranking every dimension — agent, workspace, profile, session, model,
+  provider, host — with each one's share of spend
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
@@ -94,8 +96,10 @@ Available dashboard filters:
 - profile (the proxy filter profile the call ran under; see below)
 - provider (`anthropic`, `openai-codex`, `google`, `groq`, ... derived from the request host)
 - model (as reported by the response, so a dated snapshot appears under its own name)
+- cost driver (which dimension the top-drivers table ranks; `all` lists every one)
 - host
-- table row limit
+- table rows (`10`, `25`, `50`, `100`, `250`; default `10`, which is also what a query run
+  without the parameter uses)
 
 ### Cost over time
 
@@ -125,6 +129,28 @@ nothing to divide by.
 `cost_over_time` (`/-/queries/usage/cost_over_time`) returns the same per-period figures as a
 table — calls, confirmed cost, estimated cost, and tokens — for reconciling the chart against
 the underlying rows.
+
+### Top cost drivers
+
+One table ranks every dimension the cache knows — agent, workspace, profile, session, model,
+provider and host — with each row's share of the window's spend. The `driver` filter narrows it
+to a single dimension; `all` lists them together. Ranking is *within* a dimension, not across:
+every dimension covers the same spend, so the shares add to 100% per dimension rather than down
+the table.
+
+Its `cost_usd` column is confirmed and estimated cost **added together**, unlike the rest of the
+dashboard, which keeps them apart because an estimate is priced from a placeholder or a
+provider catch-all. This table is for finding what is expensive, where one number ranks better
+than two; when the split matters, `top_cost_drivers`
+(`/-/queries/usage/top_cost_drivers`) reports the same rows with `confirmed_cost_usd` and
+`estimated_cost_usd` as separate columns.
+
+Drilling into a driver is the dashboard's own filters — pick the agent, workspace, profile or
+model and every panel follows, down to the most-expensive-calls table and its `request_id`s.
+
+Workspaces are ranked by **basename** here (`api`, not `/home/you/clients/acme/api`). This is the
+panel someone glances at over a shoulder, and a directory layout can say more about a business
+than the spend does; the full paths stay in `workspace_token_totals`.
 
 ### Cost per call
 

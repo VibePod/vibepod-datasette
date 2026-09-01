@@ -1,6 +1,7 @@
 import gzip
 import importlib
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -196,6 +197,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         "workspace": "all",
         "profile": "all",
         "model": "all",
+        "driver": "all",
         "limit": 200,
         "request_limit": 100,
     }
@@ -695,7 +697,12 @@ class AgentTokenSqlTests(unittest.TestCase):
         if estimated:
             # gpt-5.6-sol is a PLACEHOLDER rate: $1.25 per 1M input tokens.
             self._request(
-                rid, "api.openai.com", "/v1/chat/completions", container, "gpt-5.6-sol", ts=ts
+                rid,
+                "api.openai.com",
+                "/v1/chat/completions",
+                container,
+                "gpt-5.6-sol",
+                ts=ts,
             )
             body = {
                 "model": "gpt-5.6-sol",
@@ -704,7 +711,12 @@ class AgentTokenSqlTests(unittest.TestCase):
         else:
             # claude-opus-4-5 is a confirmed rate: $5.00 per 1M input tokens.
             self._request(
-                rid, "api.anthropic.com", "/v1/messages", container, "claude-opus-4-5", ts=ts
+                rid,
+                "api.anthropic.com",
+                "/v1/messages",
+                container,
+                "claude-opus-4-5",
+                ts=ts,
             )
             body = {"usage": {"input_tokens": tokens, "output_tokens": 0}}
         self._response(rid, json.dumps(body).encode(), ts=ts)
@@ -1090,6 +1102,139 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         self.assertEqual(tokens, 1_000_000)
         self.assertAlmostEqual(impact, 5.0, places=4)
+
+    def _drivers(self, **params):
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        cursor = self.conn.execute(
+            charts["top_cost_drivers"]["query"],
+            dict(dict(self.PARAMS, agent="drv"), **params),
+        )
+        columns = [c[0] for c in cursor.description]
+        return columns, cursor.fetchall()
+
+    def test_top_drivers_rank_every_dimension_in_one_table(self):
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("dv1", ts, 3_000_000, container="vibepod-drv-1")  # $15 confirmed
+        self._seed_priced_call("dv2", ts, 1_000_000, container="vibepod-drv-1")  # $5 confirmed
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._drivers()
+        dimensions = {row[columns.index("dimension")] for row in rows}
+
+        self.assertEqual(
+            dimensions,
+            {"agent", "workspace", "profile", "session", "model", "provider", "host"},
+        )
+        # Ranking is within a dimension: each one covers the same $20, so every
+        # dimension's leading row is 100% of it.
+        self.assertAlmostEqual(rows[0][columns.index("cost_usd")], 20.0, places=4)
+        self.assertAlmostEqual(rows[0][columns.index("share_pct")], 100.0, places=1)
+
+    def test_driver_cost_column_adds_confirmed_and_estimated_together(self):
+        # This table reports one cost figure; the split stays available in the
+        # top_cost_drivers query and in the pricing panels.
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("dc1", ts, 1_000_000, container="vibepod-drv-1")  # $5 confirmed
+        self._seed_priced_call(
+            "dc2",
+            ts,
+            1_000_000,
+            estimated=True,
+            container="vibepod-drv-1",
+        )  # $1.25 estimated
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._drivers(driver="agent")
+
+        self.assertAlmostEqual(rows[0][columns.index("cost_usd")], 6.25, places=4)
+
+    def test_driver_filter_narrows_to_one_dimension(self):
+        ts = "2026-08-15T10:00:00+00:00"
+        self._seed_priced_call("dv3", ts, 1_000_000, container="vibepod-drv-1")
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._drivers(driver="model")
+
+        self.assertEqual({row[columns.index("dimension")] for row in rows}, {"model"})
+        self.assertEqual([row[columns.index("value")] for row in rows], ["claude-opus-4-5"])
+
+    def test_top_cost_drivers_query_keeps_the_confirmed_estimated_split(self):
+        sql = self.metadata["databases"]["usage"]["queries"]["top_cost_drivers"]["sql"]
+
+        self.assertIn("confirmed_cost_usd", sql)
+        self.assertIn("estimated_cost_usd", sql)
+
+    def test_workspace_table_ranks_by_basename_not_full_path(self):
+        # These tables are the widest-audience panels on the dashboard, so they
+        # show the basename; full paths stay in workspace_token_totals.
+        self._session(
+            "drv2id000002",
+            "vibepod-drv-2",
+            "/home/someone/private/secret-client",
+            "2026-08-01T10:00:00+00:00",
+        )
+        self._seed_priced_call(
+            "dv4",
+            "2026-08-15T10:00:00+00:00",
+            1_000_000,
+            container="vibepod-drv-2",
+        )
+        self.source.execute(
+            "UPDATE http_requests SET source_container_id = 'drv2id000002' WHERE id = 'dv4'",
+        )
+        self.source.commit()
+        self.refresh()
+
+        columns, rows = self._drivers(driver="workspace")
+        workspaces = [row[columns.index("value")] for row in rows]
+
+        self.assertIn("secret-client", workspaces)
+        self.assertNotIn("/home/someone/private/secret-client", workspaces)
+
+    def test_no_chart_or_query_asks_for_a_parameter_the_dashboard_dropped(self):
+        # A canned query left holding a removed filter's parameter fails at
+        # request time, which no unit test of the dashboard would ever notice.
+        dashboard = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]
+        offered = set(dashboard["filters"]) | {"limit"}
+        sql = [chart["query"] for chart in dashboard["charts"].values()]
+        sql += [query["sql"] for query in self.metadata["databases"]["usage"]["queries"].values()]
+
+        for statement in sql:
+            for token in re.findall(r":([a-z_]+)", statement):
+                self.assertIn(token, offered)
+
+    def test_table_row_limit_offers_ten_and_defaults_to_it(self):
+        filters = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["filters"]
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+
+        self.assertEqual(filters["request_limit"]["options"], ["10", "25", "50", "100", "250"])
+        self.assertEqual(filters["request_limit"]["default"], "10")
+
+        # A query run without the parameter must behave like the dashboard
+        # does, so the SQL fallback tracks the dropdown default.
+        for name, chart in charts.items():
+            if ":request_limit" not in chart["query"]:
+                continue
+            with self.subTest(chart=name):
+                self.assertIn("COALESCE(:request_limit, 10)", chart["query"])
+
+    def test_table_row_limit_actually_limits(self):
+        ts = "2026-08-15T10:00:00+00:00"
+        for i in range(12):
+            # A distinct agent each, so the rows to be limited actually exist.
+            self._seed_priced_call(f"lm{i}", ts, 200_000 * (i + 1), container=f"vibepod-lm{i}-1")
+        self.source.commit()
+        self.refresh()
+
+        charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]
+        params = dict(self.PARAMS, request_limit=10)
+        params = dict(params, driver="agent")
+        rows = self.conn.execute(charts["top_cost_drivers"]["query"], params).fetchall()
+
+        self.assertEqual(len(rows), 10)
 
     def test_tokens_by_workspace_agent_includes_cost_columns(self):
         # Same priced call as test_dashboard_cost_charts_sum_bundled_pricing:
