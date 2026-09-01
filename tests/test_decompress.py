@@ -643,7 +643,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertAlmostEqual(by_agent["copilot"], 3.0)
 
     def test_dashboard_estimated_value_charts_cover_unverified_placeholder_models(self):
-        # gpt-5.6-sol has no confirmed openai.com/api/pricing figure yet, so the
+        # gpt-image-2 has no confirmed openai.com/api/pricing figure yet, so the
         # bundled entry is a PLACEHOLDER mirroring the gpt-5 tier and stays
         # is_estimated until a real source replaces it. This is the "we're
         # guessing" bucket, kept out of total_cost/cost_by_agent.
@@ -652,8 +652,8 @@ class AgentTokenSqlTests(unittest.TestCase):
             "api.openai.com",
             "/v1/chat/completions",
             "vibepod-openai-plc1",
-            "gpt-5.6-sol",
-            # gpt-5.6-sol's bundled price is only effective_from 2026-08-01;
+            "gpt-image-2",
+            # gpt-image-2's bundled price is only effective_from 2026-08-01;
             # the seed's default timestamp (2026-07-26) predates it.
             ts="2026-08-15T10:00:00+00:00",
         )
@@ -661,7 +661,7 @@ class AgentTokenSqlTests(unittest.TestCase):
             "r5",
             json.dumps(
                 {
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-image-2",
                     "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
                 },
             ).encode(),
@@ -687,7 +687,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         # placeholder above, and the seeded codex call priced by the
         # openai-codex catch-all because its model matched no entry.
         codex_catch_all = 700 * 1.25 / 1_000_000 + 90 * 10.0 / 1_000_000
-        placeholder = 1.25 + 10.0
+        placeholder = 5.0 + 40.0
         self.assertAlmostEqual(total_estimated_value, placeholder + codex_catch_all, places=4)
         self.assertAlmostEqual(by_agent["openai"], placeholder, places=4)
         self.assertAlmostEqual(by_agent["codex"], codex_catch_all, places=4)
@@ -695,17 +695,17 @@ class AgentTokenSqlTests(unittest.TestCase):
     def _seed_priced_call(self, rid, ts, tokens, estimated=False, container="vibepod-cst-1"):
         """One call that prices at a known figure, on either side of is_estimated."""
         if estimated:
-            # gpt-5.6-sol is a PLACEHOLDER rate: $1.25 per 1M input tokens.
+            # gpt-image-2 is a PLACEHOLDER rate: $5.00 per 1M input tokens.
             self._request(
                 rid,
                 "api.openai.com",
                 "/v1/chat/completions",
                 container,
-                "gpt-5.6-sol",
+                "gpt-image-2",
                 ts=ts,
             )
             body = {
-                "model": "gpt-5.6-sol",
+                "model": "gpt-image-2",
                 "usage": {"prompt_tokens": tokens, "completion_tokens": 0},
             }
         else:
@@ -744,7 +744,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         older_day, newer_day = older[:10], newer[:10]
         self.assertAlmostEqual(rows[(older_day, "confirmed")], 5.0)
         self.assertAlmostEqual(rows[(newer_day, "confirmed")], 15.0)
-        self.assertAlmostEqual(rows[(newer_day, "estimated")], 1.25)
+        self.assertAlmostEqual(rows[(newer_day, "estimated")], 5.0)
         # A bucket with calls but nothing on this series reports zero rather
         # than dropping out: the line would otherwise be drawn straight from
         # the previous point to the next, across a period that spent nothing.
@@ -937,7 +937,7 @@ class AgentTokenSqlTests(unittest.TestCase):
 
         # The estimated-only segment is still listed, with no percentiles and
         # its call counted, rather than dropped by the confirmed-price join.
-        estimated = rows[("openai", "gpt-5.6-sol")]
+        estimated = rows[("openai", "gpt-image-2")]
         self.assertEqual(estimated[columns.index("confirmed_calls")], 0)
         self.assertEqual(estimated[columns.index("estimated_calls")], 1)
         self.assertIsNone(estimated[columns.index("avg_cost_usd")])
@@ -1066,7 +1066,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         status = {row[columns.index("model")]: row[columns.index("match_status")] for row in rows}
 
         self.assertEqual(status["claude-opus-4-5"], "exact rate")
-        self.assertEqual(status["gpt-5.6-sol"], "placeholder rate")
+        self.assertEqual(status["gpt-image-2"], "placeholder rate")
         self.assertEqual(status["claude-opus-4-5-20260101"], "prefix match")
         self.assertEqual(status["l3"], "unpriced")
 
@@ -1142,13 +1142,13 @@ class AgentTokenSqlTests(unittest.TestCase):
             1_000_000,
             estimated=True,
             container="vibepod-drv-1",
-        )  # $1.25 estimated
+        )  # $5.00 estimated
         self.source.commit()
         self.refresh()
 
         columns, rows = self._drivers(driver="agent")
 
-        self.assertAlmostEqual(rows[0][columns.index("cost_usd")], 6.25, places=4)
+        self.assertAlmostEqual(rows[0][columns.index("cost_usd")], 10.0, places=4)
 
     def test_driver_filter_narrows_to_one_dimension(self):
         ts = "2026-08-15T10:00:00+00:00"
@@ -1291,15 +1291,15 @@ class AgentTokenSqlTests(unittest.TestCase):
                 {"usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}},
             ).encode(),
         )
-        # gpt-5.6-sol is an unverified PLACEHOLDER price, so this row must
+        # gpt-image-2 is an unverified PLACEHOLDER price, so this row must
         # still surface is_estimated = 1 even though most calls now don't.
         self._request(
             "r6",
             "api.openai.com",
             "/v1/chat/completions",
             "vibepod-openai-plc1",
-            "gpt-5.6-sol",
-            # gpt-5.6-sol's bundled price is only effective_from 2026-08-01;
+            "gpt-image-2",
+            # gpt-image-2's bundled price is only effective_from 2026-08-01;
             # the seed's default timestamp (2026-07-26) predates it.
             ts="2026-08-15T10:00:00+00:00",
         )
@@ -1307,7 +1307,7 @@ class AgentTokenSqlTests(unittest.TestCase):
             "r6",
             json.dumps(
                 {
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-image-2",
                     "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
                 },
             ).encode(),
@@ -1330,7 +1330,7 @@ class AgentTokenSqlTests(unittest.TestCase):
         self.assertEqual(rows["claude-opus-4-5"][estimated_idx], 0)
         # Priced by the openai-codex catch-all, so flagged estimated.
         self.assertEqual(rows["c"][estimated_idx], 1)
-        self.assertEqual(rows["gpt-5.6-sol"][estimated_idx], 1)
+        self.assertEqual(rows["gpt-image-2"][estimated_idx], 1)
 
     def test_cache_write_card_sums_cache_creation_tokens(self):
         charts = self.metadata["plugins"]["datasette-dashboards"]["agent-tokens"]["charts"]

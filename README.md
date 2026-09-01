@@ -386,10 +386,13 @@ model is never estimated, whichever product served the call — Codex bills at O
 a Copilot call is priced at the published rate of the model it actually ran (OpenAI, Anthropic or
 Google). `is_estimated = 1` is for rates with a vague reference, and there are two kinds:
 placeholders for models newer than this dataset was last verified against (`PLACEHOLDER,
-unverified` in `price_source`), and per-provider catch-alls. Every provider gets a catch-all row
-with `model = ''`: the empty string is a prefix of every model string, so it wins only when no
-more specific entry exists (an unlisted Codex model still prices at the `gpt-5`-family rate, but
-as a guess about which model ran, hence estimated). Estimated cost is never summed into the same
+unverified` in `price_source`), and per-provider catch-alls. A catch-all is a row with
+`model = ''`, and only the providers that need one have it — currently `openai-codex` and
+`github-copilot`, which serve models the request never names precisely. The empty string is a
+prefix of every model string, so such a row wins whenever no more specific entry exists (an
+unlisted Codex model still prices at the `gpt-5`-family rate, but as a guess about which model
+ran, hence estimated). A provider with no catch-all simply leaves its unmatched calls unpriced,
+which is what the pricing-coverage panels count. Estimated cost is never summed into the same
 number as confirmed cost (see below), so a guessed rate can't inflate the dashboard's
 "actual dollars" figure.
 
