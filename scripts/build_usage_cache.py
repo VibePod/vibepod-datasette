@@ -36,12 +36,18 @@ except ImportError:  # pragma: no cover - exercised via the container image
     sys.modules.setdefault("datasette", fake)
     from plugins.decompress import _extract_usage
 
-# Bump when the stored columns or their meaning change (token_usage rows, or
-# the model_pricing table shape) -- open_cache() then drops the affected
-# tables/views and rebuilds them, because old rows/columns cannot be upgraded
-# in place. model_pricing is cheap to drop: it holds no captured data, only a
-# full reload of pricing/model_prices.json on the next refresh.
-SCHEMA_VERSION = 7
+# Lives next to this script, so it imports the same way whether the script is
+# run directly (its own directory leads sys.path) or imported by the tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import model_pricing  # noqa: E402
+
+# Bump when the stored columns or their meaning change -- open_cache() then
+# drops the affected tables/views and rebuilds them, because old rows/columns
+# cannot be upgraded in place. Version 8 moved pricing from a bundled JSON
+# table to genai-prices, which prices each call at ingest and stores the
+# result on the row, so the old model_pricing table is dropped with it.
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -59,6 +65,11 @@ CREATE TABLE IF NOT EXISTS token_usage (
     cached_tokens      INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+    -- 0 when the provider reported cache tokens outside its input count
+    -- (Anthropic), 1 when they are already inside it (OpenAI, Google). Pricing
+    -- needs the total input with the cache counts as a breakdown of it, and
+    -- the field names cannot say which convention a body used.
+    input_is_total     INTEGER NOT NULL DEFAULT 1,
     has_usage          INTEGER NOT NULL DEFAULT 0,
     container_id       TEXT NOT NULL DEFAULT '',
     container_name     TEXT NOT NULL DEFAULT '',
@@ -71,8 +82,30 @@ CREATE TABLE IF NOT EXISTS token_usage (
     -- existing proxy.db reads calls that are days old, and those must still
     -- get their grace window before they are frozen as 'unknown'.
     ingested_at        TEXT NOT NULL DEFAULT '',
+    -- Cost, resolved once at ingest by scripts/model_pricing.py from the
+    -- genai-prices dataset, then stored. Pricing a call means matching a model
+    -- string against provider price data with historic rates and tiers, which
+    -- is Python work SQL cannot do; doing it per render was the whole reason
+    -- this cache exists. price_version records which genai-prices release
+    -- produced these numbers, so upgrading the package re-prices the cache
+    -- instead of leaving stale costs behind (see reprice()).
+    has_price                INTEGER NOT NULL DEFAULT 0,
+    cost_usd                 REAL,
+    is_estimated             INTEGER NOT NULL DEFAULT 0,
+    priced_provider          TEXT NOT NULL DEFAULT '',
+    priced_model             TEXT NOT NULL DEFAULT '',
+    price_effective_from     TEXT NOT NULL DEFAULT '',
+    input_price_per_1m       REAL NOT NULL DEFAULT 0,
+    output_price_per_1m      REAL NOT NULL DEFAULT 0,
+    cached_price_per_1m      REAL NOT NULL DEFAULT 0,
+    cache_write_price_per_1m REAL NOT NULL DEFAULT 0,
+    price_source             TEXT NOT NULL DEFAULT '',
+    price_version            TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (source, row_id)
 );
+
+-- Rows priced by an older genai-prices release, which reprice() re-runs.
+CREATE INDEX IF NOT EXISTS idx_token_usage_price_version ON token_usage(price_version);
 
 -- Snapshot of logs.db sessions, refilled on every refresh. Workspace
 -- resolution matches a call to the session of its container; Docker bundle
@@ -179,99 +212,40 @@ WHERE (
         )
       );
 
--- Reference pricing data, fully replaced from pricing/model_prices.json on
--- every refresh (see sync_pricing()). A row with model = '' is a per-provider
--- catch-all: every model string is a match for the empty prefix, so it only
--- wins when no more specific entry exists for that provider. is_estimated
--- marks a rate with a vague reference -- a catch-all applied to a model that
--- matched nothing, or a placeholder nobody has confirmed for this model. A
--- price published for the exact model is never estimated, whichever product
--- served the call: Codex bills at OpenAI's rates, and a Copilot call is
--- priced at the published rate of the model it actually ran.
+-- agent_token_usage plus the price that was resolved for each call at ingest
+-- (see scripts/model_pricing.py). The join is on the primary key, so this
+-- view is a projection rather than the per-row price search it replaced:
+-- matching a model string against provider price data needs regex clauses,
+-- context tiers and dated rates, which is Python work, and doing it in SQL on
+-- every render is what the usage cache exists to avoid.
 --
--- Prices change over time, so (provider, model) can have several rows with
--- different effective_from dates instead of one fixed price; a call is
--- priced at whichever rate was in effect on its own timestamp, not today's
--- rate, so historical cost totals stay correct after a price update. There
--- is no explicit "effective_to": a price's validity window implicitly ends
--- at the next later effective_from row for that same (provider, model), so
--- adding a new price point never requires touching the old row.
-CREATE TABLE IF NOT EXISTS model_pricing (
-    provider                 TEXT NOT NULL,
-    model                    TEXT NOT NULL,
-    effective_from            TEXT NOT NULL,
-    input_price_per_1m       REAL NOT NULL DEFAULT 0,
-    output_price_per_1m      REAL NOT NULL DEFAULT 0,
-    cached_price_per_1m      REAL NOT NULL DEFAULT 0,
-    cache_write_price_per_1m REAL NOT NULL DEFAULT 0,
-    currency                 TEXT NOT NULL DEFAULT 'USD',
-    is_estimated             INTEGER NOT NULL DEFAULT 0,
-    price_source             TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (provider, model, effective_from)
-);
-
--- agent_token_usage plus a per-row price match and computed cost. A call is
--- matched to the model_pricing row for its provider whose model is the
--- longest prefix of the captured model string and whose effective_from is
--- the latest one on or before the call's own timestamp -- an exact model
--- match is always the longest possible prefix, so this one rule covers both
--- exact pricing entries and dated snapshots (e.g. 'claude-opus-4-5-20260101'
--- priced as 'claude-opus-4-5') without separate logic, and picking the
--- latest effective_from <= the call's timestamp applies whichever price was
--- actually in effect when the call happened. reasoning_tokens are already
--- included in output_tokens by every provider's own accounting, so there is
--- no separate reasoning price. has_price/cost_usd are only set when
--- has_usage = 1: a call with no parsed token counts has nothing to price,
--- regardless of whether a matching pricing entry exists. is_estimated flags
--- cost_usd as computed from a vague price reference (see model_pricing
--- above); dashboards must sum confirmed and estimated cost separately so a
--- guessed rate never inflates the figure read as actual spend.
+-- reasoning_tokens are excluded from pricing on purpose: providers disagree
+-- about whether they already sit inside output_tokens, and only a couple of
+-- models price them separately. has_price/cost_usd are only set when
+-- has_usage = 1, because a call with no parsed token counts has nothing to
+-- price whatever its model is. is_estimated flags a cost whose provider was
+-- inferred from the model string rather than known from the host; dashboards
+-- sum confirmed and estimated separately so a guess never inflates the figure
+-- read as actual spend. price_effective_from is NULL rather than empty when
+-- the applied rate carries no start date, so date arithmetic on it yields
+-- NULL instead of a nonsense age.
 CREATE VIEW IF NOT EXISTS agent_token_cost AS
-WITH matched AS (
-    SELECT
-        t.*,
-        (
-            SELECT mp.model FROM model_pricing mp
-            WHERE mp.provider = t.provider
-              AND t.model LIKE mp.model || '%'
-              AND datetime(mp.effective_from) <= datetime(t.timestamp)
-            ORDER BY length(mp.model) DESC, datetime(mp.effective_from) DESC
-            LIMIT 1
-        ) AS priced_model,
-        (
-            SELECT mp.effective_from FROM model_pricing mp
-            WHERE mp.provider = t.provider
-              AND t.model LIKE mp.model || '%'
-              AND datetime(mp.effective_from) <= datetime(t.timestamp)
-            ORDER BY length(mp.model) DESC, datetime(mp.effective_from) DESC
-            LIMIT 1
-        ) AS priced_effective_from
-    FROM agent_token_usage t
-)
 SELECT
-    m.*,
-    mp.input_price_per_1m,
-    mp.output_price_per_1m,
-    mp.cached_price_per_1m,
-    mp.cache_write_price_per_1m,
-    mp.currency AS price_currency,
-    mp.price_source,
-    mp.effective_from AS price_effective_from,
-    COALESCE(mp.is_estimated, 0) AS is_estimated,
-    CASE WHEN m.has_usage = 1 AND mp.provider IS NOT NULL THEN 1 ELSE 0 END AS has_price,
-    CASE
-        WHEN m.has_usage = 1 AND mp.provider IS NOT NULL THEN
-            (m.input_tokens * mp.input_price_per_1m
-             + m.output_tokens * mp.output_price_per_1m
-             + m.cached_tokens * mp.cached_price_per_1m
-             + m.cache_write_tokens * mp.cache_write_price_per_1m) / 1000000.0
-        ELSE NULL
-    END AS cost_usd
-FROM matched m
-LEFT JOIN model_pricing mp
-    ON mp.provider = m.provider
-   AND mp.model = m.priced_model
-   AND mp.effective_from = m.priced_effective_from;
+    u.*,
+    t.input_price_per_1m,
+    t.output_price_per_1m,
+    t.cached_price_per_1m,
+    t.cache_write_price_per_1m,
+    'USD' AS price_currency,
+    t.price_source,
+    NULLIF(t.price_effective_from, '') AS price_effective_from,
+    t.priced_provider,
+    t.priced_model,
+    t.is_estimated,
+    CASE WHEN u.has_usage = 1 THEN t.has_price ELSE 0 END AS has_price,
+    CASE WHEN u.has_usage = 1 AND t.has_price = 1 THEN t.cost_usd ELSE NULL END AS cost_usd
+FROM agent_token_usage u
+JOIN token_usage t ON t.source = u.source AND t.row_id = u.row_id;
 """
 
 # {profile} is filled in by profile_expr() below: a proxy.db written before the
@@ -348,11 +322,8 @@ def open_cache(path: Path) -> sqlite3.Connection:
             # Refilled from logs.db on every refresh, so dropping it costs
             # nothing and keeps a later column change from being missed here.
             "DROP TABLE IF EXISTS session_windows;"
-            # Refilled from pricing/model_prices.json on every refresh (see
-            # sync_pricing()), so dropping it loses nothing either -- this is
-            # what actually fixes a column-shape change like adding
-            # is_estimated/effective_from that CREATE TABLE IF NOT EXISTS
-            # cannot apply to an existing table.
+            # Pricing moved onto the token_usage row itself in version 8; this
+            # clears the reference table older caches still carry.
             "DROP TABLE IF EXISTS model_pricing;",
         )
     conn.executescript(SCHEMA)
@@ -419,6 +390,29 @@ def _row_values(
     # request body is only a fallback (a websocket upgrade carries no model, and
     # one connection can serve several models).
     model = usage.get("model") or extract_model(request_body)
+    provider = usage.get("provider") or "unknown"
+    input_tokens = int(usage.get("input") or 0)
+    output_tokens = int(usage.get("output") or 0)
+    cached_tokens = int(usage.get("cached") or 0)
+    cache_write_tokens = int(usage.get("cache_write") or 0)
+    has_usage = int(usage.get("found") or 0)
+    input_is_total = int(usage.get("input_is_total", 1))
+    # A call with no parsed usage has nothing to price, so the lookup is
+    # skipped rather than run against token counts that are all zero.
+    price = (
+        price_row(
+            provider,
+            model or "unknown",
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            input_is_total,
+            ts,
+        )
+        if has_usage
+        else model_pricing.UNPRICED
+    )
     return (
         source,
         row_id,
@@ -426,15 +420,16 @@ def _row_values(
         usage.get("response_id") or "",
         ts or "",
         agent_from_container(container),
-        usage.get("provider") or "unknown",
+        provider,
         model or "unknown",
         host or "unknown",
-        int(usage.get("input") or 0),
-        int(usage.get("output") or 0),
-        int(usage.get("cached") or 0),
-        int(usage.get("cache_write") or 0),
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        cache_write_tokens,
         int(usage.get("reasoning") or 0),
-        int(usage.get("found") or 0),
+        input_is_total,
+        has_usage,
         # Docker's short id is the prefix of the full one, so truncating here
         # matches either length to the session's container_id.
         (container_id or "")[:12],
@@ -450,16 +445,108 @@ def _row_values(
         "",
         "",
         ingested_at or datetime.now(UTC).isoformat(),
+        *_price_values(price),
     )
 
 
+def price_row(
+    provider,
+    model,
+    input_tokens,
+    output_tokens,
+    cached_tokens,
+    cache_write_tokens,
+    input_is_total,
+    ts,
+):
+    """Price one call at the rate in effect at its own timestamp."""
+    return model_pricing.price_call(
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        cache_write_tokens,
+        input_is_total,
+        _parse_ts(ts or ""),
+    )
+
+
+def _price_values(price):
+    """The stored price columns, in INSERT_SQL / REPRICE_SQL order."""
+    return (
+        price.has_price,
+        price.cost_usd,
+        price.is_estimated,
+        price.priced_provider,
+        price.priced_model,
+        price.price_effective_from,
+        price.input_price_per_1m,
+        price.output_price_per_1m,
+        price.cached_price_per_1m,
+        price.cache_write_price_per_1m,
+        price.price_source,
+        model_pricing.dataset_version(),
+    )
+
+
+PRICE_COLUMNS = (
+    "has_price",
+    "cost_usd",
+    "is_estimated",
+    "priced_provider",
+    "priced_model",
+    "price_effective_from",
+    "input_price_per_1m",
+    "output_price_per_1m",
+    "cached_price_per_1m",
+    "cache_write_price_per_1m",
+    "price_source",
+    "price_version",
+)
+
+# The usage and attribution columns, in the order _row_values() returns them;
+# the price columns follow, in PRICE_COLUMNS order.
+USAGE_COLUMNS = (
+    "source",
+    "row_id",
+    "request_id",
+    "response_id",
+    "timestamp",
+    "agent",
+    "provider",
+    "model",
+    "host",
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "input_is_total",
+    "has_usage",
+    "container_id",
+    "container_name",
+    "profile",
+    "session_id",
+    "workspace",
+    "workspace_name",
+    "ingested_at",
+)
+
+INSERT_COLUMNS = USAGE_COLUMNS + PRICE_COLUMNS
+
 INSERT_SQL = (
-    "INSERT INTO token_usage (source, row_id, request_id, response_id, timestamp, agent, "
-    "provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, "
-    "reasoning_tokens, has_usage, container_id, container_name, profile, session_id, "
-    "workspace, workspace_name, ingested_at) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-    "ON CONFLICT(source, row_id) DO NOTHING"
+    "INSERT INTO token_usage ("
+    + ", ".join(INSERT_COLUMNS)
+    + ") VALUES ("
+    + ", ".join(["?"] * len(INSERT_COLUMNS))
+    + ") ON CONFLICT(source, row_id) DO NOTHING"
+)
+
+REPRICE_SQL = (
+    "UPDATE token_usage SET "
+    + ", ".join(f"{column} = ?" for column in PRICE_COLUMNS)
+    + " WHERE source = ? AND row_id = ?"
 )
 
 
@@ -490,68 +577,34 @@ def sync_source(source, sql, src, cache, batch_size, max_rows):
     return processed
 
 
-def default_pricing_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "pricing" / "model_prices.json"
+def reprice(cache: sqlite3.Connection) -> int:
+    """Re-price rows that were priced by a different genai-prices release.
 
-
-PRICING_UPSERT_SQL = (
-    "INSERT INTO model_pricing (provider, model, effective_from, input_price_per_1m, "
-    "output_price_per_1m, cached_price_per_1m, cache_write_price_per_1m, currency, "
-    "is_estimated, price_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-)
-
-
-def _pricing_row(entry: dict):
-    return (
-        str(entry["provider"]),
-        str(entry["model"]),
-        str(entry["effective_from"]),
-        float(entry.get("input_price_per_1m") or 0),
-        float(entry.get("output_price_per_1m") or 0),
-        float(entry.get("cached_price_per_1m") or 0),
-        float(entry.get("cache_write_price_per_1m") or 0),
-        str(entry.get("currency") or "USD"),
-        1 if entry.get("is_estimated") else 0,
-        str(entry.get("price_source") or ""),
-    )
-
-
-def sync_pricing(cache: sqlite3.Connection, pricing_path: Path) -> int:
-    """Fully replace model_pricing from the bundled pricing file.
-
-    Unlike token_usage (an incremental cache of captured traffic), pricing is
-    small, static reference data, so every refresh just reloads it wholesale:
-    an entry removed from the file is gone from the table too, and a bad or
-    missing file leaves the previous rows in place rather than wiping cost
-    data because of a transient read error.
+    Costs are computed once at ingest and stored, so a package upgrade would
+    otherwise leave every existing row at the rate that shipped with the old
+    release. Each row records the release that priced it, which makes finding
+    the stale ones an indexed lookup and a no-op refresh genuinely free.
+    Rows without parsed usage are skipped: they have nothing to price, and
+    re-checking them every upgrade would scan the whole cache for no reason.
+    A rebuild (``--full``) needs nothing extra, because re-ingested rows are
+    priced by the current release on the way in.
     """
-    if not pricing_path.exists():
-        print(f"pricing cache: no pricing file at {pricing_path}, skipping", flush=True)
-        return 0
-    try:
-        entries = json.loads(pricing_path.read_text())
-    except (OSError, ValueError) as exc:
-        print(f"pricing cache: skipped ({exc})", file=sys.stderr, flush=True)
-        return 0
-    if not isinstance(entries, list):
-        print(
-            f"pricing cache: skipped ({pricing_path} is not a list of entries)",
-            file=sys.stderr,
-            flush=True,
-        )
+    rows = cache.execute(
+        "SELECT source, row_id, provider, model, input_tokens, output_tokens, "
+        "cached_tokens, cache_write_tokens, input_is_total, timestamp "
+        "FROM token_usage WHERE has_usage = 1 AND price_version IS NOT ?",
+        (model_pricing.dataset_version(),),
+    ).fetchall()
+    if not rows:
         return 0
 
-    rows = []
-    for entry in entries:
-        try:
-            rows.append(_pricing_row(entry))
-        except (KeyError, TypeError, ValueError) as exc:
-            print(f"pricing cache: skipped a malformed entry ({exc})", file=sys.stderr, flush=True)
-
-    cache.execute("DELETE FROM model_pricing")
-    cache.executemany(PRICING_UPSERT_SQL, rows)
+    updates = []
+    for source, row_id, provider, model, inp, out, cached, cache_write, is_total, ts in rows:
+        price = price_row(provider, model, inp, out, cached, cache_write, is_total, ts)
+        updates.append((*_price_values(price), source, row_id))
+    cache.executemany(REPRICE_SQL, updates)
     cache.commit()
-    return len(rows)
+    return len(updates)
 
 
 GRACE_SECONDS = 15 * 60
@@ -765,6 +818,11 @@ def _log_resolution_counts(counts) -> None:
         )
 
 
+def _log_repriced(count: int) -> None:
+    if count:
+        print(f"pricing: repriced {count} rows with {model_pricing.dataset_version()}", flush=True)
+
+
 def build(
     proxy_path: Path,
     usage_path: Path,
@@ -772,7 +830,6 @@ def build(
     batch_size=500,
     max_rows=0,
     full=False,
-    pricing_path: Path | None = None,
 ):
     cache = open_cache(usage_path)
     if full:
@@ -781,12 +838,10 @@ def build(
         cache.execute("DELETE FROM session_windows")
         cache.commit()
 
-    priced_rows = sync_pricing(cache, pricing_path or default_pricing_path())
-    print(f"pricing cache: {priced_rows} price rows loaded", flush=True)
-
     if not proxy_path.exists():
         if logs_path is not None:
             _log_resolution_counts(sync_sessions(logs_path, cache))
+        _log_repriced(reprice(cache))
         cache.close()
         return {"http": 0, "ws": 0}
 
@@ -815,6 +870,9 @@ def build(
             )
         if logs_path is not None:
             _log_resolution_counts(sync_sessions(logs_path, cache))
+        # After ingest, so rows priced moments ago by the current release are
+        # already current and cost nothing to skip.
+        _log_repriced(reprice(cache))
     finally:
         src.close()
         cache.close()
@@ -835,11 +893,6 @@ def main() -> int:
         "--logs-db",
         default=os.environ.get("LOGS_DB_PATH", "/data/logs.db"),
         help="session log database used to resolve workspaces and profiles",
-    )
-    parser.add_argument(
-        "--pricing-file",
-        default=os.environ.get("PRICING_FILE_PATH", ""),
-        help="model pricing JSON; defaults to the bundled pricing/model_prices.json",
     )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument(
@@ -868,7 +921,7 @@ def main() -> int:
     proxy_path = Path(args.proxy_db)
     usage_path = Path(args.usage_db)
     logs_path = Path(args.logs_db)
-    pricing_path = Path(args.pricing_file) if args.pricing_file else default_pricing_path()
+    model_pricing.warn_if_unavailable()
 
     while True:
         started = time.time()
@@ -880,7 +933,6 @@ def main() -> int:
                 batch_size=args.batch_size,
                 max_rows=args.max_rows,
                 full=args.full,
-                pricing_path=pricing_path,
             )
             print(
                 f"usage cache: +{counts['http']} http, +{counts['ws']} ws rows "

@@ -11,8 +11,8 @@ Datasette container for browsing both VibePod SQLite databases:
 - agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
 - `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
   attributed to the workspace and the proxy profile each call came from via `logs.db`
-- token usage is priced from a bundled pricing dataset (`pricing/model_prices.json`), exposed
-  alongside usage as cost cards/tables on the `agent-tokens` dashboard
+- token usage is priced from the shared [`pydantic/genai-prices`](https://github.com/pydantic/genai-prices)
+  dataset, exposed alongside usage as cost cards/tables on the `agent-tokens` dashboard
 
 ## Environment
 
@@ -25,7 +25,6 @@ Datasette container for browsing both VibePod SQLite databases:
   `PROXY_DB_PATH` so it persists across container recreation, falling back to
   `/data/usage.db` when that directory is not writable)
 - `USAGE_REFRESH_SECONDS` (default `300`, how often the cache picks up new traffic)
-- `PRICING_FILE_PATH` (model pricing JSON; defaults to the bundled `pricing/model_prices.json`)
 - `TRUNCATE_CELLS_HTML` (default `80`, compacts long cell values in list/table views)
 
 ## Usage
@@ -59,8 +58,8 @@ It includes:
 - total tokens, input, output, cached input, cache write, and reasoning summary cards
   (token counts are shown with a `tok` unit)
 - total cost and cost-by-agent chart (USD, calls priced from a confirmed rate only)
-- estimated cost and estimated-cost-by-agent chart (USD, calls priced from a vague
-  reference — a placeholder or a provider catch-all; see "How usage is priced" below)
+- estimated cost and estimated-cost-by-agent chart (USD, calls whose provider had to be
+  inferred from the model name; see "How usage is priced" below)
 - cost over time, confirmed vs estimated, at the selected bucket, plus a card comparing
   confirmed cost with the previous window of the same length (see "Cost over time" below)
 - average, median and p95 cost per call (confirmed prices; see "Cost per call" below)
@@ -79,8 +78,8 @@ It includes:
 - usage-coverage table: calls per host split into parsed vs unparsed
 - pricing-coverage table: calls per provider/model split into priced vs unpriced
 - unpriced token volume, and what it would have cost at this window's confirmed rate
-- pricing-quality table: how each call was priced — exact rate, prefix match, provider
-  catch-all, placeholder, or not at all — with the age of the rate that was applied
+- pricing-quality table: how each call was priced — exact rate, alias match, inferred
+  provider, or not at all — with the age of the rate that was applied
 - cost-per-call table by provider and model, with the call counts each statistic rests on
 - most-expensive-calls table, ranked by cost and carrying the request id
 - outlier-calls table: calls costing at least 3x the median call of their own model
@@ -139,8 +138,8 @@ every dimension covers the same spend, so the shares add to 100% per dimension r
 the table.
 
 Its `cost_usd` column is confirmed and estimated cost **added together**, unlike the rest of the
-dashboard, which keeps them apart because an estimate is priced from a placeholder or a
-provider catch-all. This table is for finding what is expensive, where one number ranks better
+dashboard, which keeps them apart because an estimate is priced from an inferred provider.
+This table is for finding what is expensive, where one number ranks better
 than two; when the split matters, `top_cost_drivers`
 (`/-/queries/usage/top_cost_drivers`) reports the same rows with `confirmed_cost_usd` and
 `estimated_cost_usd` as separate columns.
@@ -155,8 +154,8 @@ than the spend does; the full paths stay in `workspace_token_totals`.
 ### Cost per call
 
 Three cards report the distribution of what a single call costs — average, median and p95 — over
-calls priced from a **confirmed** rate. Estimated ones are excluded on purpose: a placeholder or
-a catch-all rate would move a percentile without anyone having verified the number behind it.
+calls priced from a **confirmed** rate. Estimated ones are excluded on purpose: a rate reached by
+guessing which provider billed the call would move a percentile on an assumption.
 
 SQLite has no percentile function, so the rows are ranked and the statistic is read off the
 ranking: the median averages the one or two middle ranks (so an even count works), and p95 is the
@@ -178,10 +177,11 @@ median call of their *own* model rather than a global one — $5 is unremarkable
 absurd for Haiku — and only for models with at least five calls in the window, so nothing is
 flagged on the evidence of two; each row carries that median, the ratio, and the `request_id`.
 **Models billed at more than one rate** in the window surface separately, because a rate change
-moves cost while usage stands still, and would otherwise read as a usage change. That table is
-the one place estimated rows are kept: a placeholder replaced by a confirmed rate is itself a
-pricing change, and its `is_estimated` column keeps a change of rate distinct from a change of
-confidence.
+moves cost while usage stands still, and would otherwise read as a usage change. Rows are grouped
+by the rate that was actually applied rather than by a published start date, so both a dated price
+change (OpenAI cut `o3` from $10 to $2 per 1M input tokens in June 2025) and an undated one (an
+off-peak window like DeepSeek's) show up. That table is the one place estimated rows are kept, and
+its `is_estimated` column keeps a change of rate distinct from a change of confidence.
 
 ### How tokens are attributed to a workspace
 
@@ -356,87 +356,99 @@ by the server, so gzip, Zstandard, and Brotli responses are all decoded before p
 
 ### How usage is priced
 
-`pricing/model_prices.json` is a bundled, curated table of $-per-million-token rates per
-provider/model (input, output, cached input, cache write). `scripts/build_usage_cache.py`
-loads it into `usage.db`'s `model_pricing` table on every refresh, fully replacing the table
-each time: it is small, static reference data, not derived from captured traffic, so an entry
-removed from the file disappears from the table too. A missing or unreadable pricing file
-leaves the previous rows in place rather than wiping cost data over a transient error. Point
-`PRICING_FILE_PATH` at a different JSON file to override the bundled dataset.
+Rates come from [`pydantic/genai-prices`](https://github.com/pydantic/genai-prices), a shared,
+community-maintained dataset of published provider pricing. This repository holds no rates of its
+own: `scripts/model_pricing.py` hands the package a call's provider, model and token counts and
+stores what comes back. That dataset covers far more models than a table kept by hand here ever
+did, and it carries the awkward parts of real pricing — historic rates, dated price changes,
+off-peak windows, and context tiers where a long prompt bills at a higher rate.
 
-A call is priced by matching `model_pricing` rows for its provider and picking the one whose
-`model` is the **longest prefix** of the captured model string. An exact match is always the
-longest possible prefix, so this one rule covers both exact entries and dated snapshots (e.g.
-`claude-opus-4-5-20260101` prices as `claude-opus-4-5`) without separate logic. `reasoning_tokens`
-are already included in `output_tokens` by every provider's own accounting, so there is no
-separate reasoning price.
+Pricing runs **once per call, at ingest**, and the result is stored on the `token_usage` row.
+Matching a model string against the dataset means regexes, aliases and date constraints, which is
+Python work rather than SQL, and doing it per render is exactly what the usage cache exists to
+avoid. `agent_token_cost` (usage.db) is therefore a plain projection of `agent_token_usage` plus
+the stored price columns, not a search.
 
-Provider prices change over time, so `(provider, model)` can have several `model_pricing` rows
-with different `effective_from` dates rather than one fixed price. A call is priced at whichever
-rate was in effect on its own `timestamp` — the latest `effective_from` on or before that
-timestamp — never at today's rate, so historical cost totals stay correct after a price update.
-There is no explicit "effective to": a price's validity window implicitly ends at the next later
-`effective_from` row for that same `(provider, model)`, so adding a new price point never
-requires editing the old row. `pricing/model_prices.json` includes a real example of this
-(`openai`/`gpt-4o`'s August 2024 price cut) alongside single-point entries for models with only
-one known price so far.
+Three things decide what a call costs:
 
-`is_estimated` says one thing: how solid the price reference is. A rate published for that exact
-model is never estimated, whichever product served the call — Codex bills at OpenAI's rates, and
-a Copilot call is priced at the published rate of the model it actually ran (OpenAI, Anthropic or
-Google). `is_estimated = 1` is for rates with a vague reference, and there are two kinds:
-placeholders for models newer than this dataset was last verified against (`PLACEHOLDER,
-unverified` in `price_source`), and per-provider catch-alls. A catch-all is a row with
-`model = ''`, and only the providers that need one have it — currently `openai-codex` and
-`github-copilot`, which serve models the request never names precisely. The empty string is a
-prefix of every model string, so such a row wins whenever no more specific entry exists (an
-unlisted Codex model still prices at the `gpt-5`-family rate, but as a guess about which model
-ran, hence estimated). A provider with no catch-all simply leaves its unmatched calls unpriced,
-which is what the pricing-coverage panels count. Estimated cost is never summed into the same
-number as confirmed cost (see below), so a guessed rate can't inflate the dashboard's
-"actual dollars" figure.
+- **Which provider billed it.** The cache labels a call by the host it went to, which names a
+  product, not always a billing provider. `anthropic`, `openai`, `google`, `groq`, `mistral`,
+  `deepseek`, `xai` and `openrouter` map straight through, and so does `openai-codex`: Codex is
+  OpenAI's own product and bills at OpenAI's published rates, so `gpt-5-codex` prices at the
+  `gpt-5` rate as confirmed spend. A host that fronts several vendors (`github-copilot`) never
+  says who billed the call, so the provider is identified from the model string instead — see
+  `is_estimated` below.
+- **Which model ran.** The dataset matches aliases and dated snapshots, so
+  `claude-opus-4-5-20260101` prices as `claude-opus-4-5`. A model string nothing matches leaves
+  the call unpriced rather than guessed at.
+- **When it ran.** Rates are resolved against the call's own `timestamp`, never today's, so
+  historical cost totals stay correct after a provider changes a price. A call older than every
+  rate the dataset knows for that model is priced at the earliest one rather than dropped.
 
-The `agent_token_cost` view (usage.db) is `agent_token_usage` plus this price match and a
-computed `cost_usd`/`is_estimated`. Both `has_price` and `cost_usd` are only set when a call
-also has `has_usage = 1`: a call with no parsed token counts has nothing to price, regardless of
-whether a pricing entry exists for its model. On the `agent-tokens` dashboard, `total_cost` /
-`cost_by_agent` sum only calls priced from a confirmed rate (`has_price = 1 AND
-is_estimated = 0`); `total_estimated_value` / `estimated_value_by_agent` sum only the calls
-priced from a vague reference (`is_estimated = 1`) as a separate figure. The
-`tokens_by_agent_model` table and the
+Cache tokens need care, because providers disagree about what "input tokens" means: Anthropic
+reports `input_tokens` **excluding** cache reads and writes, while OpenAI and Google count cached
+tokens **inside** their input total. The field names cannot tell the two apart (Anthropic and
+OpenAI's Responses API both call it `input_tokens`), so the extractor records which convention a
+body used and the cache counts are added back only when they are not already included. Each part
+is then billed at its own rate. This also fixes a double charge: cached OpenAI and Google tokens
+used to be billed once at the input rate and again at the cache rate.
+
+`reasoning_tokens` are not passed to the pricer. Providers disagree about whether they already sit
+inside the output count, and only a couple of models price them separately, so feeding in an
+ambiguous number would move a cost figure on a guess.
+
+`is_estimated` says one thing: whether the provider was **known** or **inferred**. A call to a
+host that names its billing provider is confirmed cost. A call whose provider had to be read off
+the model string is priced from a published rate too, but which provider that rate belongs to is a
+guess, so it is reported separately. Estimated cost is never summed into the same number as
+confirmed cost, so a guess can't inflate the dashboard's "actual dollars" figure.
+
+Both `has_price` and `cost_usd` are only set when a call also has `has_usage = 1`: a call with no
+parsed token counts has nothing to price, whatever its model. On the `agent-tokens` dashboard,
+`total_cost` / `cost_by_agent` sum only calls priced from a confirmed rate (`has_price = 1 AND
+is_estimated = 0`); `total_estimated_value` / `estimated_value_by_agent` sum only the inferred
+ones (`is_estimated = 1`) as a separate figure. The `tokens_by_agent_model` table and the
 `pricing_coverage` chart/query (also at `/-/queries/usage/pricing_coverage`) both report
 `real_cost_usd` and `estimated_cost_usd` as separate columns for the same reason, alongside
 `priced_calls`/`unpriced_calls` so calls with usage but no matching price stay visible instead of
-silently under-reporting. The current pricing table itself is queryable at
-`/-/queries/usage/model_pricing_table`.
+silently under-reporting. The rates actually applied to captured calls are queryable at
+`/-/queries/usage/model_pricing_table`, each row carrying the `price_source` it came from.
+
+Because costs are stored rather than recomputed, each row also records the `genai-prices` release
+that priced it. Upgrading the package (rebuild the image, or `pip install -U genai-prices`) makes
+the next refresh re-price the rows that release did not produce, and log
+`pricing: repriced N rows`; a cache that is already current does no work. Prices are not fetched
+over the network — they ship with the installed package version, so the container stays offline.
+Without `genai-prices` installed, usage still ingests and totals normally and every call is simply
+left unpriced.
 
 ### Pricing coverage and quality
 
 `pricing_quality` (chart, and `/-/queries/usage/pricing_quality`) says how every call got its
 price, which is the difference between "this cost $0" and "we could not price this":
 
-- **exact rate** — a pricing entry for that exact model string.
-- **prefix match** — a dated snapshot priced off its undated entry, e.g.
-  `claude-opus-4-5-20260101` at the `claude-opus-4-5` rate. Correct by design, but worth seeing.
-- **provider catch-all** — the `model = ''` row, applied because nothing more specific matched.
-- **placeholder rate** — a rate nobody has confirmed for that model.
-- **unpriced** — no entry matched at all, so the call has no cost and is missing from every
-  cost total.
+- **exact rate** — the model string matched a priced model directly.
+- **alias match** — matched under another name, e.g. `claude-opus-4-5-20260101` at the
+  `claude-opus-4-5` rate, or `gpt-5-codex` at the `gpt-5` rate. Correct by design, but worth
+  seeing.
+- **provider inferred** — the host serves several vendors, so the provider was identified from
+  the model string. Priced, but not counted as confirmed spend.
+- **unpriced** — nothing matched, so the call has no cost and is missing from every cost total.
 
-Each row carries the `price_effective_from` it used and how old that rate was when the call was
-made. There is deliberately no "stale" verdict: an old rate is only a problem if the real price
-moved, which the dataset cannot know, so the age is reported and the reader decides.
+Each row carries the `price_effective_from` of the rate it applied and how old that rate was when
+the call was made. Most published rates carry no start date, and those read as blank rather than
+inventing one. There is deliberately no "stale" verdict: an old rate is only a problem if the real
+price moved, which the dataset cannot know, so the age is reported and the reader decides.
 
 Two cards size the gap: the token volume nothing could price, and what that volume **would**
 have cost at the average confirmed rate of the same window. The second is an extrapolation and
 its title says so — it answers "how much money is this coverage gap hiding", not "what was
 spent". With no confirmed calls in the window it is blank rather than zero.
 
-`pricing/model_prices.json` is manually maintained; update it directly (add a new row with a
-later `effective_from` for a price change, rather than editing the old one) and the next refresh
-picks it up, no rebuild step required. Some entries are placeholders for models newer than this
-dataset was last verified against (marked `PLACEHOLDER, unverified` in `price_source`) — check
-those against the provider's current pricing page before trusting them.
+A missing or wrong rate is worth fixing upstream, where every project using the dataset gets it:
+the provider files live in [`prices/providers`](https://github.com/pydantic/genai-prices/tree/main/prices)
+and take pull requests. Note the project's own warning that these prices are a best-effort
+estimate rather than a bill.
 
 ## HTTP Requests Dashboard
 

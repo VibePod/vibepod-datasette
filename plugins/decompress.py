@@ -183,6 +183,21 @@ _USAGE_FIELDS = {
     ),
 }
 
+# Cache paths whose tokens sit *outside* the reported input count. Anthropic
+# reports input_tokens excluding both cache reads and cache writes, while
+# OpenAI (prompt_tokens / input_tokens) and Google (promptTokenCount) count
+# cached tokens inside their input total. Pricing needs the total with the
+# cache counts as a breakdown of it, so which convention a body used has to
+# survive extraction -- the field names alone cannot say, because Anthropic and
+# OpenAI's Responses API both call the field "input_tokens" and mean different
+# things by it.
+_CACHE_OUTSIDE_INPUT = frozenset(
+    {
+        ("cache_read_input_tokens",),
+        ("cache_creation_input_tokens",),
+    },
+)
+
 # Where a usage object can sit inside an event payload.
 _USAGE_CONTAINERS = (
     ("usage",),
@@ -213,12 +228,15 @@ def _dig(obj, path):
     return obj
 
 
-def _merge_usage(usage, totals):
+def _merge_usage(usage, totals, conventions=None):
     """Merge one usage object into ``totals`` keeping the largest value seen.
 
     Streaming APIs emit cumulative usage repeatedly (Anthropic sends the running
     ``output_tokens`` in every ``message_delta``, Google repeats
     ``usageMetadata`` per chunk), so max is correct where sum would multiply.
+
+    ``conventions`` collects the cache paths that matched, which is what says
+    whether the input count already includes them (see ``_CACHE_OUTSIDE_INPUT``).
     """
     found = False
     for field, paths in _USAGE_FIELDS.items():
@@ -227,19 +245,21 @@ def _merge_usage(usage, totals):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
             found = True
+            if conventions is not None:
+                conventions.add(path)
             if value > totals[field]:
                 totals[field] = int(value)
             break
     return found
 
 
-def _collect_usage(obj, totals):
+def _collect_usage(obj, totals, conventions=None):
     if not isinstance(obj, dict):
         return False
     found = False
     for path in _USAGE_CONTAINERS:
         usage = _dig(obj, path)
-        if isinstance(usage, dict) and _merge_usage(usage, totals):
+        if isinstance(usage, dict) and _merge_usage(usage, totals, conventions):
             found = True
     return found
 
@@ -299,10 +319,13 @@ def _extract_usage(data, host=None):
     """Return normalized token usage for a response body as a JSON string.
 
     Output keys: ``provider``, ``model``, ``response_id``, ``input``,
-    ``output``, ``cached``, ``cache_write``, ``reasoning``, ``found``.
-    ``found`` is 0 when no usage could be parsed, which lets dashboards
-    separate "zero tokens" from "not captured" instead of silently
-    under-reporting.
+    ``output``, ``cached``, ``cache_write``, ``reasoning``, ``found``,
+    ``input_is_total``. ``found`` is 0 when no usage could be parsed, which
+    lets dashboards separate "zero tokens" from "not captured" instead of
+    silently under-reporting. ``input_is_total`` is 0 when the provider
+    reported cache tokens outside its input count (Anthropic) and 1 when they
+    are already inside it, which is what pricing needs to avoid charging the
+    same tokens twice or dropping them.
 
     ``response_id`` exists so callers can drop duplicate usage events for the
     same logical call. Tools that count from Codex session logs have hit
@@ -328,11 +351,12 @@ def _extract_usage(data, host=None):
     totals = {field: 0 for field in _USAGE_FIELDS}
     found = False
     identity = {"model": "", "response_id": ""}
+    conventions = set()
     text = _ungzip(data) if data is not None else ""
     if text:
         for event in _iter_events(text):
             _collect_identity(event, identity)
-            if _collect_usage(event, totals):
+            if _collect_usage(event, totals, conventions):
                 found = True
 
     result = json.dumps(
@@ -346,6 +370,9 @@ def _extract_usage(data, host=None):
             "cache_write": totals["cache_write"],
             "reasoning": totals["reasoning"],
             "found": 1 if found else 0,
+            # A body reporting no cache tokens at all trivially has its whole
+            # input in the input count, so 1 is the safe default.
+            "input_is_total": 0 if conventions & _CACHE_OUTSIDE_INPUT else 1,
         },
     )
     if key is not None:
