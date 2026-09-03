@@ -9,9 +9,10 @@ Datasette container for browsing both VibePod SQLite databases:
 - built-in HTTP observability dashboard via `datasette-dashboards` at `/-/dashboards/http-requests`
 - agent sessions dashboard via `datasette-dashboards` at `/-/dashboards/agent-sessions`
 - agent proxy requests dashboard via `datasette-dashboards` at `/-/dashboards/agent-proxy-requests`
-- dedicated Codex token dashboard via `datasette-dashboards` at `/-/dashboards/codex-tokens`
 - `usage.db` with per-call token usage materialized from `proxy.db` by `scripts/build_usage_cache.py`,
-  attributed to the workspace each call came from via `logs.db`
+  attributed to the workspace and the proxy profile each call came from via `logs.db`
+- token usage is priced from a bundled pricing dataset (`pricing/model_prices.json`), exposed
+  alongside usage as cost cards/tables on the `agent-tokens` dashboard
 
 ## Environment
 
@@ -24,6 +25,7 @@ Datasette container for browsing both VibePod SQLite databases:
   `PROXY_DB_PATH` so it persists across container recreation, falling back to
   `/data/usage.db` when that directory is not writable)
 - `USAGE_REFRESH_SECONDS` (default `300`, how often the cache picks up new traffic)
+- `PRICING_FILE_PATH` (model pricing JSON; defaults to the bundled `pricing/model_prices.json`)
 - `TRUNCATE_CELLS_HTML` (default `80`, compacts long cell values in list/table views)
 
 ## Usage
@@ -56,25 +58,130 @@ It includes:
 
 - total tokens, input, output, cached input, cache write, and reasoning summary cards
   (token counts are shown with a `tok` unit)
+- total cost and cost-by-agent chart (USD, calls priced from a confirmed rate only)
+- estimated cost and estimated-cost-by-agent chart (USD, calls priced from a vague
+  reference — a placeholder or a provider catch-all; see "How usage is priced" below)
+- cost over time, confirmed vs estimated, at the selected bucket, plus a card comparing
+  confirmed cost with the previous window of the same length (see "Cost over time" below)
+- average, median and p95 cost per call (confirmed prices; see "Cost per call" below)
+- top-cost-drivers table ranking every dimension — agent, workspace, profile, session, model,
+  provider, host — with each one's share of spend
 - calls-with-usage count
 - tokens by agent and by provider, split into input vs output series (stacked bars)
 - token trend over time (input vs output series)
 - tokens by workspace, split into input vs output series, plus a count of active workspaces
-- tokens by agent and model table, including cached and cache-write columns
+- tokens by profile, split into input vs output series, plus a count of active profiles
+- tokens by agent and model table, including cached, cache-write, and cost columns
 - tokens by workspace and agent table
+- tokens and cost by profile and agent table
+- tokens and cost by session table, plus a count of active sessions
 - recent calls table with per-call token fields
 - usage-coverage table: calls per host split into parsed vs unparsed
+- pricing-coverage table: calls per provider/model split into priced vs unpriced
+- unpriced token volume, and what it would have cost at this window's confirmed rate
+- pricing-quality table: how each call was priced — exact rate, prefix match, provider
+  catch-all, placeholder, or not at all — with the age of the rate that was applied
+- cost-per-call table by provider and model, with the call counts each statistic rests on
+- most-expensive-calls table, ranked by cost and carrying the request id
+- outlier-calls table: calls costing at least 3x the median call of their own model
+- rate-changes table: models billed at more than one rate inside the window
 
 Available dashboard filters:
 
-- time range (`1h`, `24h`, `7d`, `30d`, `all`; default `24h`)
-- trend bucket (`auto`, `5min`, `hour`, `day`; `auto` uses 5-minute slots for `1h`,
-  hourly for `24h`, and daily beyond that)
+- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `3m`, `6m`, `1y`, `all`; default `24h`)
+- trend bucket (`auto`, `5min`, `hour`, `day`, `week`, `month`; `auto` uses 5-minute slots
+  up to `4h`, hourly for `24h`, and daily beyond that)
 - agent (derived from `source_container_name`, e.g. `vibepod-tau-...` -> `tau`)
 - workspace (the directory the agent ran in, resolved from `logs.db`; see below)
+- profile (the proxy filter profile the call ran under; see below)
 - provider (`anthropic`, `openai-codex`, `google`, `groq`, ... derived from the request host)
+- model (as reported by the response, so a dated snapshot appears under its own name)
+- cost driver (which dimension the top-drivers table ranks; `all` lists every one)
 - host
-- table row limit
+- table rows (`10`, `25`, `50`, `100`, `250`; default `10`, which is also what a query run
+  without the parameter uses)
+
+### Cost over time
+
+The cost trend charts spend per period at the selected trend bucket, so the same chart answers
+daily, weekly, and monthly with the `day`, `week`, and `month` buckets — a week starts on its
+Monday, a month on the 1st. Confirmed and estimated cost are separate stacked series, never one
+total, for the reason in "How usage is priced" below.
+
+It uses the same line mark as the token trend, and both trends bind their legend: click a
+legend entry to isolate that series (the others fade out), click it again to bring them back. A bucket with calls but no cost on one series
+reports zero, so the line dips through it instead of being drawn straight from the previous
+point to the next; a bucket with no calls at all produces no point, exactly as on the token
+trend. A period where calls happened but nothing could be priced reads as zero on a *cost*
+chart — the pricing-coverage table is where unpriced calls show up.
+
+Next to it, a card reports the **percentage change in confirmed cost** between two rolling
+windows: the selected range ending now, and the window of the same length immediately before it.
+At the default `24h` that is the last 24 hours against the 24 hours before those; at `7d`, the
+last seven days against the seven before. These are rolling windows anchored on the current
+time, not calendar days or weeks, so both sides are always the same length. Every other filter
+(agent, workspace, profile, provider, model, host) applies to both windows, and estimated cost is
+excluded from both — this card is about money with a confirmed price behind it. It reads blank
+rather than showing a number in the two cases where a percentage would be meaningless: the `all`
+range, which has no preceding window, and a previous window with no confirmed spend, which has
+nothing to divide by.
+
+`cost_over_time` (`/-/queries/usage/cost_over_time`) returns the same per-period figures as a
+table — calls, confirmed cost, estimated cost, and tokens — for reconciling the chart against
+the underlying rows.
+
+### Top cost drivers
+
+One table ranks every dimension the cache knows — agent, workspace, profile, session, model,
+provider and host — with each row's share of the window's spend. The `driver` filter narrows it
+to a single dimension; `all` lists them together. Ranking is *within* a dimension, not across:
+every dimension covers the same spend, so the shares add to 100% per dimension rather than down
+the table.
+
+Its `cost_usd` column is confirmed and estimated cost **added together**, unlike the rest of the
+dashboard, which keeps them apart because an estimate is priced from a placeholder or a
+provider catch-all. This table is for finding what is expensive, where one number ranks better
+than two; when the split matters, `top_cost_drivers`
+(`/-/queries/usage/top_cost_drivers`) reports the same rows with `confirmed_cost_usd` and
+`estimated_cost_usd` as separate columns.
+
+Drilling into a driver is the dashboard's own filters — pick the agent, workspace, profile or
+model and every panel follows, down to the most-expensive-calls table and its `request_id`s.
+
+Workspaces are ranked by **basename** here (`api`, not `/home/you/clients/acme/api`). This is the
+panel someone glances at over a shoulder, and a directory layout can say more about a business
+than the spend does; the full paths stay in `workspace_token_totals`.
+
+### Cost per call
+
+Three cards report the distribution of what a single call costs — average, median and p95 — over
+calls priced from a **confirmed** rate. Estimated ones are excluded on purpose: a placeholder or
+a catch-all rate would move a percentile without anyone having verified the number behind it.
+
+SQLite has no percentile function, so the rows are ranked and the statistic is read off the
+ranking: the median averages the one or two middle ranks (so an even count works), and p95 is the
+nearest-rank definition with the ceiling written as integer arithmetic, because `ceil()` is only
+present when SQLite was compiled with its math functions.
+
+`cost_per_call_by_model` repeats all of it per provider and model, next to the call counts each
+statistic rests on: total calls, how many had a confirmed price, how many were estimated, and how
+many could not be priced at all. A segment priced from two of its two hundred calls is then
+visibly that, instead of showing a confident-looking average. Segments with no confirmed price
+still appear, with empty statistics, rather than dropping out of the table.
+`cost_per_request` (`/-/queries/usage/cost_per_request`) is the same figures as a query.
+
+The most-expensive-calls table ranks individual calls and carries each one's `request_id`, which
+is the key to look the call up in `proxy.db` where its request and response bodies live.
+
+Two further tables answer questions the totals cannot. **Outlier calls** are judged against the
+median call of their *own* model rather than a global one — $5 is unremarkable for Opus and
+absurd for Haiku — and only for models with at least five calls in the window, so nothing is
+flagged on the evidence of two; each row carries that median, the ratio, and the `request_id`.
+**Models billed at more than one rate** in the window surface separately, because a rate change
+moves cost while usage stands still, and would otherwise read as a usage change. That table is
+the one place estimated rows are kept: a placeholder replaced by a confirmed rate is itself a
+pricing change, and its `is_estimated` column keeps a change of rate distinct from a change of
+confidence.
 
 ### How tokens are attributed to a workspace
 
@@ -114,6 +221,56 @@ pending=…`), and two queries make the attribution auditable:
 sums, and `workspace_resolution` for the per-container breakdown of resolved and still
 pending rows. A dashboard dominated by `unknown` means the container link is not working —
 which is visible as a number rather than as silently misattributed tokens.
+
+### How calls are attributed to a profile
+
+A profile is the proxy filter profile a container runs under (`vibepod profile list`), which
+decides which hosts that agent may reach. Attributing tokens to it answers what a given
+policy actually costs, and pairs with the filter panels on the HTTP Requests dashboard that
+show what it blocked.
+
+Unlike the workspace, the profile has two possible sources, and they are tried in this order:
+
+- **The request row wins.** The proxy writes `http_requests.profile` when it applies the
+  policy, so that value is the profile the call was actually filtered under, and the cache
+  stores it verbatim at ingest.
+- **The session is the fallback**, resolved from `sessions.profile` through the same
+  container match the workspace uses (id first, name second). It covers calls the proxy
+  captured without a profile.
+
+Everything else mirrors the workspace contract: an unresolved profile is retried on every
+refresh, decided `unknown` once the 15-minute grace window closes, and shown as `unknown`
+rather than as a blank label, so per-profile totals still add up to the overall total. The
+refresh logs `profile resolution: by_session=…, unknown=…, pending=…` next to the workspace
+line, and `profile_token_totals` (`/-/queries/usage/profile_token_totals`) and
+`profile_resolution` make the attribution auditable the same way.
+
+Both source columns are recent, so the cache tolerates databases written without them: a
+`proxy.db` whose `http_requests` has no `profile` column still ingests (those rows fall back
+to the session), and a `logs.db` whose `sessions` has none simply resolves no profile. The
+profile panels on the **HTTP Requests** and **Agent Sessions** dashboards read those source
+columns directly, so they need a proxy and a CLI new enough to write them; the token
+dashboards do not, because they read the cache.
+
+### How calls are attributed to a session
+
+The session is the run an agent was doing when it made the call — one `vp run`, one row in
+`logs.db`'s `sessions` table. It answers "what did *this* run cost", which is the question
+behind an unexpected bill: a workspace total says which project, a session total says which run.
+
+`proxy.db` has no session column, so the session id is resolved exactly like the workspace, from
+the same `session_windows` snapshot and the same container match. One extra rule applies, because
+a container id names a *container*, not a session, and a container can host more than one (re-
+attaching opens another): among the sessions of the matched container, the call is attributed to
+the one that started last on or before the call's own timestamp. A call older than every session
+of that container keeps the earliest one rather than going unattributed.
+
+A call whose container has no session row at all is counted under `unknown`, so per-session
+totals still add up to the overall total, and the refresh logs `session resolution: resolved=…,
+unknown=…, pending=…` beside the workspace and profile lines. `session_token_totals`
+(`/-/queries/usage/session_token_totals`) reports calls, tokens, and confirmed/estimated cost per
+session with its agent, workspace and profile; `session_resolution` breaks resolved and still
+pending rows down per container.
 
 ### Why there is a usage cache
 
@@ -197,6 +354,90 @@ If a host shows many `unparsed_calls`, that provider either does not report usag
 captured response or uses a field shape that is not mapped yet. Bodies are stored as sent
 by the server, so gzip, Zstandard, and Brotli responses are all decoded before parsing.
 
+### How usage is priced
+
+`pricing/model_prices.json` is a bundled, curated table of $-per-million-token rates per
+provider/model (input, output, cached input, cache write). `scripts/build_usage_cache.py`
+loads it into `usage.db`'s `model_pricing` table on every refresh, fully replacing the table
+each time: it is small, static reference data, not derived from captured traffic, so an entry
+removed from the file disappears from the table too. A missing or unreadable pricing file
+leaves the previous rows in place rather than wiping cost data over a transient error. Point
+`PRICING_FILE_PATH` at a different JSON file to override the bundled dataset.
+
+A call is priced by matching `model_pricing` rows for its provider and picking the one whose
+`model` is the **longest prefix** of the captured model string. An exact match is always the
+longest possible prefix, so this one rule covers both exact entries and dated snapshots (e.g.
+`claude-opus-4-5-20260101` prices as `claude-opus-4-5`) without separate logic. `reasoning_tokens`
+are already included in `output_tokens` by every provider's own accounting, so there is no
+separate reasoning price.
+
+Provider prices change over time, so `(provider, model)` can have several `model_pricing` rows
+with different `effective_from` dates rather than one fixed price. A call is priced at whichever
+rate was in effect on its own `timestamp` — the latest `effective_from` on or before that
+timestamp — never at today's rate, so historical cost totals stay correct after a price update.
+There is no explicit "effective to": a price's validity window implicitly ends at the next later
+`effective_from` row for that same `(provider, model)`, so adding a new price point never
+requires editing the old row. `pricing/model_prices.json` includes a real example of this
+(`openai`/`gpt-4o`'s August 2024 price cut) alongside single-point entries for models with only
+one known price so far.
+
+`is_estimated` says one thing: how solid the price reference is. A rate published for that exact
+model is never estimated, whichever product served the call — Codex bills at OpenAI's rates, and
+a Copilot call is priced at the published rate of the model it actually ran (OpenAI, Anthropic or
+Google). `is_estimated = 1` is for rates with a vague reference, and there are two kinds:
+placeholders for models newer than this dataset was last verified against (`PLACEHOLDER,
+unverified` in `price_source`), and per-provider catch-alls. A catch-all is a row with
+`model = ''`, and only the providers that need one have it — currently `openai-codex` and
+`github-copilot`, which serve models the request never names precisely. The empty string is a
+prefix of every model string, so such a row wins whenever no more specific entry exists (an
+unlisted Codex model still prices at the `gpt-5`-family rate, but as a guess about which model
+ran, hence estimated). A provider with no catch-all simply leaves its unmatched calls unpriced,
+which is what the pricing-coverage panels count. Estimated cost is never summed into the same
+number as confirmed cost (see below), so a guessed rate can't inflate the dashboard's
+"actual dollars" figure.
+
+The `agent_token_cost` view (usage.db) is `agent_token_usage` plus this price match and a
+computed `cost_usd`/`is_estimated`. Both `has_price` and `cost_usd` are only set when a call
+also has `has_usage = 1`: a call with no parsed token counts has nothing to price, regardless of
+whether a pricing entry exists for its model. On the `agent-tokens` dashboard, `total_cost` /
+`cost_by_agent` sum only calls priced from a confirmed rate (`has_price = 1 AND
+is_estimated = 0`); `total_estimated_value` / `estimated_value_by_agent` sum only the calls
+priced from a vague reference (`is_estimated = 1`) as a separate figure. The
+`tokens_by_agent_model` table and the
+`pricing_coverage` chart/query (also at `/-/queries/usage/pricing_coverage`) both report
+`real_cost_usd` and `estimated_cost_usd` as separate columns for the same reason, alongside
+`priced_calls`/`unpriced_calls` so calls with usage but no matching price stay visible instead of
+silently under-reporting. The current pricing table itself is queryable at
+`/-/queries/usage/model_pricing_table`.
+
+### Pricing coverage and quality
+
+`pricing_quality` (chart, and `/-/queries/usage/pricing_quality`) says how every call got its
+price, which is the difference between "this cost $0" and "we could not price this":
+
+- **exact rate** — a pricing entry for that exact model string.
+- **prefix match** — a dated snapshot priced off its undated entry, e.g.
+  `claude-opus-4-5-20260101` at the `claude-opus-4-5` rate. Correct by design, but worth seeing.
+- **provider catch-all** — the `model = ''` row, applied because nothing more specific matched.
+- **placeholder rate** — a rate nobody has confirmed for that model.
+- **unpriced** — no entry matched at all, so the call has no cost and is missing from every
+  cost total.
+
+Each row carries the `price_effective_from` it used and how old that rate was when the call was
+made. There is deliberately no "stale" verdict: an old rate is only a problem if the real price
+moved, which the dataset cannot know, so the age is reported and the reader decides.
+
+Two cards size the gap: the token volume nothing could price, and what that volume **would**
+have cost at the average confirmed rate of the same window. The second is an extrapolation and
+its title says so — it answers "how much money is this coverage gap hiding", not "what was
+spent". With no confirmed calls in the window it is blank rather than zero.
+
+`pricing/model_prices.json` is manually maintained; update it directly (add a new row with a
+later `effective_from` for a price change, rather than editing the old one) and the next refresh
+picks it up, no rebuild step required. Some entries are placeholders for models newer than this
+dataset was last verified against (marked `PLACEHOLDER, unverified` in `price_source`) — check
+those against the provider's current pricing page before trusting them.
+
 ## HTTP Requests Dashboard
 
 Open `http://localhost:8001/-/dashboards/http-requests` to view an aggregated dashboard for proxied HTTP traffic.
@@ -208,11 +449,15 @@ It includes:
 - status code distribution
 - top hosts by traffic/errors/latency
 - request/error trend chart (hourly or daily buckets)
+- filter visibility: the mode last seen, how many requests were blocked, blocked hosts
+  (allow-list candidates) and hosts that passed with the filter active (deny-list candidates)
+- filter decisions by profile: blocked vs passed per proxy filter profile, so a block can be
+  traced back to the policy that caused it
 - filterable/sortable recent-request table
 
 Available dashboard filters/sorting:
 
-- time range (`1h`, `24h`, `7d`, `30d`, `all`)
+- time range (`1h`, `2h`, `4h`, `24h`, `7d`, `30d`, `all`)
 - host substring match
 - method filter
 - agent filter (derived from `source_container_name`, e.g. `vibepod-codex-...` -> `codex`)
@@ -220,36 +465,11 @@ Available dashboard filters/sorting:
 - request table sort (time/status/duration/error-priority)
 - host ranking sort (volume/error-count/latency)
 
+The profile columns on those panels come from `http_requests.profile`, written by the proxy
+when it applies a policy; against a proxy that does not record it yet, only those panels
+report an error, the rest of the dashboard is unaffected.
+
 If the dashboard reports that `http_requests` is missing, start VibePod traffic capture first (the proxy DB schema is created by `vibepod-proxy` once traffic is recorded).
-
-## Codex Token Dashboard
-
-> Superseded by the All Agents Token Usage dashboard, which covers Codex alongside every other agent. Kept for now and listed last on the dashboards index.
-
-Open `http://localhost:8001/-/dashboards/codex-tokens` to view token and model usage for Codex traffic proxied through `chatgpt.com` and `api.openai.com`.
-
-It includes:
-
-- total API calls
-- total input and output tokens
-- cached input token totals
-- reasoning token totals
-- token trend over time
-- model and endpoint breakdowns
-- websocket message volume and direction trend
-- recent websocket-message table (with message type + content preview)
-- recent-call table with per-request token fields
-
-Available dashboard filters:
-
-- time range (`1h`, `24h`, `7d`, `30d`, `all`)
-- trend bucket (`auto`, `hour`, `day`)
-- model
-- container
-- endpoint (`backend_codex`, `backend_codex_ws`, `responses`, `chat_completions`)
-- request row limit
-
-The dashboard only includes requests attributed to the `codex` agent from `source_container_name`.
 
 ## Agent Sessions Dashboard
 
@@ -264,7 +484,8 @@ It includes:
 - top workspaces by session and message volume
 - sessions-over-time trend (multi-series per agent, daily or hourly buckets)
 - sessions by hour-of-day distribution (work-habits view)
-- recent sessions drill-down table (per-session message counts)
+- recent sessions drill-down table (per-session message counts and the profile the session
+  ran under, from `sessions.profile`)
 
 Available dashboard filters:
 
@@ -305,7 +526,9 @@ Agent identity is derived from `http_requests.source_container_name` (e.g. `vibe
 
 ## Codex Websocket Discovery Queries
 
-Use these proxy canned queries to inspect websocket payload structure and validate token calculations:
+Codex reports token usage on a websocket frame rather than in the HTTP response, which is what
+`scripts/build_usage_cache.py` reads. Use these proxy canned queries to inspect that payload
+structure and validate the token calculations against it:
 
 - `codex_ws_recent_messages`
 - `codex_ws_message_type_counts`

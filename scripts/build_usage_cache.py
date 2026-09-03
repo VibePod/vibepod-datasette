@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -35,9 +36,12 @@ except ImportError:  # pragma: no cover - exercised via the container image
     sys.modules.setdefault("datasette", fake)
     from plugins.decompress import _extract_usage
 
-# Bump when the stored columns or their meaning change; open_cache() then drops
-# the cache and re-parses, because old rows cannot be upgraded in place.
-SCHEMA_VERSION = 3
+# Bump when the stored columns or their meaning change (token_usage rows, or
+# the model_pricing table shape) -- open_cache() then drops the affected
+# tables/views and rebuilds them, because old rows/columns cannot be upgraded
+# in place. model_pricing is cheap to drop: it holds no captured data, only a
+# full reload of pricing/model_prices.json on the next refresh.
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -58,6 +62,8 @@ CREATE TABLE IF NOT EXISTS token_usage (
     has_usage          INTEGER NOT NULL DEFAULT 0,
     container_id       TEXT NOT NULL DEFAULT '',
     container_name     TEXT NOT NULL DEFAULT '',
+    profile            TEXT NOT NULL DEFAULT '',
+    session_id         TEXT NOT NULL DEFAULT '',
     workspace          TEXT NOT NULL DEFAULT '',
     workspace_name     TEXT NOT NULL DEFAULT '',
     -- When this row was written, which is what the resolution grace period
@@ -71,21 +77,30 @@ CREATE TABLE IF NOT EXISTS token_usage (
 -- Snapshot of logs.db sessions, refilled on every refresh. Workspace
 -- resolution matches a call to the session of its container; Docker bundle
 -- ids are reused for container names, so the id (12-char prefix) is the
--- reliable key, the name only a fallback.
+-- reliable key, the name only a fallback. profile is carried along as the
+-- fallback source for calls the proxy captured without one.
 CREATE TABLE IF NOT EXISTS session_windows (
     container_id12   TEXT NOT NULL,
     container_name   TEXT NOT NULL,
     workspace        TEXT NOT NULL,
     workspace_name   TEXT NOT NULL,
+    profile          TEXT NOT NULL DEFAULT '',
+    session_id       TEXT NOT NULL DEFAULT '',
     started_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_windows_id ON session_windows(container_id12);
 CREATE INDEX IF NOT EXISTS idx_session_windows_name ON session_windows(container_name, started_at);
 
--- Rows whose workspace has not been resolved yet; the partial index keeps
--- rescans cheap. Unresolvable rows age out after GRACE_SECONDS below and are
--- decided 'unknown' once, so they are not retried on every refresh.
+-- Rows whose workspace or profile has not been resolved yet; the partial
+-- indexes keep rescans cheap. Unresolvable rows age out after GRACE_SECONDS
+-- below and are decided 'unknown' once, so they are not retried on every
+-- refresh.
 CREATE INDEX IF NOT EXISTS idx_token_usage_pending ON token_usage(workspace) WHERE workspace = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_pending_profile ON token_usage(profile)
+    WHERE profile = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_pending_session ON token_usage(session_id)
+    WHERE session_id = '';
+CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage(agent);
@@ -99,16 +114,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 
 -- Two de-duplication rules:
---   1. Codex subscription calls report usage on a websocket frame while their
---      HTTP twin carries none; keep the websocket row, drop the twin.
+--   1. Codex calls report usage on a websocket frame while their HTTP twin
+--      carries none; keep the websocket row, drop the twin.
 --   2. A provider can emit the same usage snapshot more than once for one
 --      logical call, which inflates totals (see ccusage issue #884). When a
 --      response id is present, keep a single row per (request_id, response_id)
 --      -- the one reporting the most tokens, since a later snapshot may be the
 --      complete one.
--- Explicit column list so the workspace columns can be normalized: rows
--- whose resolution is still pending would otherwise surface an empty label,
--- which is exactly the bucket the 'unknown' fallback avoids.
+-- Explicit column list so the workspace and profile columns can be
+-- normalized: rows whose resolution is still pending would otherwise surface
+-- an empty label, which is exactly the bucket the 'unknown' fallback avoids.
 CREATE VIEW IF NOT EXISTS agent_token_usage AS
 SELECT
     t.source,
@@ -128,6 +143,14 @@ SELECT
     t.has_usage,
     t.container_id,
     t.container_name,
+    CASE
+        WHEN t.profile = '' THEN 'unknown'
+        ELSE t.profile
+    END AS profile,
+    CASE
+        WHEN t.session_id = '' THEN 'unknown'
+        ELSE t.session_id
+    END AS session_id,
     CASE
         WHEN t.workspace = '' THEN 'unknown'
         ELSE t.workspace
@@ -155,11 +178,108 @@ WHERE (
             LIMIT 1
         )
       );
+
+-- Reference pricing data, fully replaced from pricing/model_prices.json on
+-- every refresh (see sync_pricing()). A row with model = '' is a per-provider
+-- catch-all: every model string is a match for the empty prefix, so it only
+-- wins when no more specific entry exists for that provider. is_estimated
+-- marks a rate with a vague reference -- a catch-all applied to a model that
+-- matched nothing, or a placeholder nobody has confirmed for this model. A
+-- price published for the exact model is never estimated, whichever product
+-- served the call: Codex bills at OpenAI's rates, and a Copilot call is
+-- priced at the published rate of the model it actually ran.
+--
+-- Prices change over time, so (provider, model) can have several rows with
+-- different effective_from dates instead of one fixed price; a call is
+-- priced at whichever rate was in effect on its own timestamp, not today's
+-- rate, so historical cost totals stay correct after a price update. There
+-- is no explicit "effective_to": a price's validity window implicitly ends
+-- at the next later effective_from row for that same (provider, model), so
+-- adding a new price point never requires touching the old row.
+CREATE TABLE IF NOT EXISTS model_pricing (
+    provider                 TEXT NOT NULL,
+    model                    TEXT NOT NULL,
+    effective_from            TEXT NOT NULL,
+    input_price_per_1m       REAL NOT NULL DEFAULT 0,
+    output_price_per_1m      REAL NOT NULL DEFAULT 0,
+    cached_price_per_1m      REAL NOT NULL DEFAULT 0,
+    cache_write_price_per_1m REAL NOT NULL DEFAULT 0,
+    currency                 TEXT NOT NULL DEFAULT 'USD',
+    is_estimated             INTEGER NOT NULL DEFAULT 0,
+    price_source             TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (provider, model, effective_from)
+);
+
+-- agent_token_usage plus a per-row price match and computed cost. A call is
+-- matched to the model_pricing row for its provider whose model is the
+-- longest prefix of the captured model string and whose effective_from is
+-- the latest one on or before the call's own timestamp -- an exact model
+-- match is always the longest possible prefix, so this one rule covers both
+-- exact pricing entries and dated snapshots (e.g. 'claude-opus-4-5-20260101'
+-- priced as 'claude-opus-4-5') without separate logic, and picking the
+-- latest effective_from <= the call's timestamp applies whichever price was
+-- actually in effect when the call happened. reasoning_tokens are already
+-- included in output_tokens by every provider's own accounting, so there is
+-- no separate reasoning price. has_price/cost_usd are only set when
+-- has_usage = 1: a call with no parsed token counts has nothing to price,
+-- regardless of whether a matching pricing entry exists. is_estimated flags
+-- cost_usd as computed from a vague price reference (see model_pricing
+-- above); dashboards must sum confirmed and estimated cost separately so a
+-- guessed rate never inflates the figure read as actual spend.
+CREATE VIEW IF NOT EXISTS agent_token_cost AS
+WITH matched AS (
+    SELECT
+        t.*,
+        (
+            SELECT mp.model FROM model_pricing mp
+            WHERE mp.provider = t.provider
+              AND t.model LIKE mp.model || '%'
+              AND datetime(mp.effective_from) <= datetime(t.timestamp)
+            ORDER BY length(mp.model) DESC, datetime(mp.effective_from) DESC
+            LIMIT 1
+        ) AS priced_model,
+        (
+            SELECT mp.effective_from FROM model_pricing mp
+            WHERE mp.provider = t.provider
+              AND t.model LIKE mp.model || '%'
+              AND datetime(mp.effective_from) <= datetime(t.timestamp)
+            ORDER BY length(mp.model) DESC, datetime(mp.effective_from) DESC
+            LIMIT 1
+        ) AS priced_effective_from
+    FROM agent_token_usage t
+)
+SELECT
+    m.*,
+    mp.input_price_per_1m,
+    mp.output_price_per_1m,
+    mp.cached_price_per_1m,
+    mp.cache_write_price_per_1m,
+    mp.currency AS price_currency,
+    mp.price_source,
+    mp.effective_from AS price_effective_from,
+    COALESCE(mp.is_estimated, 0) AS is_estimated,
+    CASE WHEN m.has_usage = 1 AND mp.provider IS NOT NULL THEN 1 ELSE 0 END AS has_price,
+    CASE
+        WHEN m.has_usage = 1 AND mp.provider IS NOT NULL THEN
+            (m.input_tokens * mp.input_price_per_1m
+             + m.output_tokens * mp.output_price_per_1m
+             + m.cached_tokens * mp.cached_price_per_1m
+             + m.cache_write_tokens * mp.cache_write_price_per_1m) / 1000000.0
+        ELSE NULL
+    END AS cost_usd
+FROM matched m
+LEFT JOIN model_pricing mp
+    ON mp.provider = m.provider
+   AND mp.model = m.priced_model
+   AND mp.effective_from = m.priced_effective_from;
 """
 
+# {profile} is filled in by profile_expr() below: a proxy.db written before the
+# proxy logged profiles has no such column, and a hard reference would fail the
+# whole ingest instead of leaving the profile empty for those rows.
 HTTP_SQL = """
 SELECT resp.id, r.id, COALESCE(r.timestamp, resp.timestamp), r.source_container_name,
-       r.source_container_id, r.host, r.body, resp.body
+       r.source_container_id, {profile}, r.host, r.body, resp.body
 FROM http_responses resp
 JOIN http_requests r ON r.id = resp.request_id
 WHERE resp.id > ? AND r.method = 'POST' AND resp.body IS NOT NULL AND length(resp.body) > 0
@@ -169,7 +289,7 @@ LIMIT ?
 
 WS_SQL = """
 SELECT ws.id, r.id, ws.timestamp, r.source_container_name, r.source_container_id,
-       r.host, r.body, ws.content
+       {profile}, r.host, r.body, ws.content
 FROM websocket_messages ws
 JOIN http_requests r ON r.id = ws.request_id
 WHERE ws.id > ?
@@ -218,13 +338,22 @@ def open_cache(path: Path) -> sqlite3.Connection:
     if version and version < SCHEMA_VERSION:
         # Older rows lack response ids and took the model from the request body,
         # so they cannot be migrated; drop and re-parse from proxy.db.
+        # agent_token_cost depends on both agent_token_usage and model_pricing,
+        # so it must be dropped first.
         conn.executescript(
+            "DROP VIEW IF EXISTS agent_token_cost;"
             "DROP VIEW IF EXISTS agent_token_usage;"
             "DROP TABLE IF EXISTS token_usage;"
             "DROP TABLE IF EXISTS sync_state;"
             # Refilled from logs.db on every refresh, so dropping it costs
             # nothing and keeps a later column change from being missed here.
-            "DROP TABLE IF EXISTS session_windows;",
+            "DROP TABLE IF EXISTS session_windows;"
+            # Refilled from pricing/model_prices.json on every refresh (see
+            # sync_pricing()), so dropping it loses nothing either -- this is
+            # what actually fixes a column-shape change like adding
+            # is_estimated/effective_from that CREATE TABLE IF NOT EXISTS
+            # cannot apply to an existing table.
+            "DROP TABLE IF EXISTS model_pricing;",
         )
     conn.executescript(SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -237,6 +366,22 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     ).fetchone()
     return row is not None
+
+
+def has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def profile_expr(conn: sqlite3.Connection, table: str, alias: str) -> str:
+    """SQL for the profile of `table`, or a constant when the column is absent.
+
+    Both sources grew their profile column after this cache shipped -- the
+    proxy on http_requests, the CLI on sessions -- so either shape can be in
+    the field. A missing column has to cost the profile of the rows it would
+    have named, never the whole refresh.
+    """
+    return f"{alias}.profile" if has_column(conn, table, "profile") else "''"
 
 
 def watermark(cache: sqlite3.Connection, source: str) -> int:
@@ -263,6 +408,7 @@ def _row_values(
     ts,
     container,
     container_id,
+    profile,
     host,
     request_body,
     payload,
@@ -293,6 +439,12 @@ def _row_values(
         # matches either length to the session's container_id.
         (container_id or "")[:12],
         container or "",
+        # The proxy records the profile on the request itself; when it did not,
+        # the resolution pass fills it in from the container's session.
+        profile or "",
+        # Session id only exists in logs.db, so it is resolved after ingest
+        # alongside the workspace.
+        "",
         # Workspace is resolved in the dedicated pass after ingest, because the
         # session row may only appear in logs.db after the call was captured.
         "",
@@ -304,9 +456,9 @@ def _row_values(
 INSERT_SQL = (
     "INSERT INTO token_usage (source, row_id, request_id, response_id, timestamp, agent, "
     "provider, model, host, input_tokens, output_tokens, cached_tokens, cache_write_tokens, "
-    "reasoning_tokens, has_usage, container_id, container_name, workspace, workspace_name, "
-    "ingested_at) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "reasoning_tokens, has_usage, container_id, container_name, profile, session_id, "
+    "workspace, workspace_name, ingested_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT(source, row_id) DO NOTHING"
 )
 
@@ -338,6 +490,70 @@ def sync_source(source, sql, src, cache, batch_size, max_rows):
     return processed
 
 
+def default_pricing_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "pricing" / "model_prices.json"
+
+
+PRICING_UPSERT_SQL = (
+    "INSERT INTO model_pricing (provider, model, effective_from, input_price_per_1m, "
+    "output_price_per_1m, cached_price_per_1m, cache_write_price_per_1m, currency, "
+    "is_estimated, price_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _pricing_row(entry: dict):
+    return (
+        str(entry["provider"]),
+        str(entry["model"]),
+        str(entry["effective_from"]),
+        float(entry.get("input_price_per_1m") or 0),
+        float(entry.get("output_price_per_1m") or 0),
+        float(entry.get("cached_price_per_1m") or 0),
+        float(entry.get("cache_write_price_per_1m") or 0),
+        str(entry.get("currency") or "USD"),
+        1 if entry.get("is_estimated") else 0,
+        str(entry.get("price_source") or ""),
+    )
+
+
+def sync_pricing(cache: sqlite3.Connection, pricing_path: Path) -> int:
+    """Fully replace model_pricing from the bundled pricing file.
+
+    Unlike token_usage (an incremental cache of captured traffic), pricing is
+    small, static reference data, so every refresh just reloads it wholesale:
+    an entry removed from the file is gone from the table too, and a bad or
+    missing file leaves the previous rows in place rather than wiping cost
+    data because of a transient read error.
+    """
+    if not pricing_path.exists():
+        print(f"pricing cache: no pricing file at {pricing_path}, skipping", flush=True)
+        return 0
+    try:
+        entries = json.loads(pricing_path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"pricing cache: skipped ({exc})", file=sys.stderr, flush=True)
+        return 0
+    if not isinstance(entries, list):
+        print(
+            f"pricing cache: skipped ({pricing_path} is not a list of entries)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
+
+    rows = []
+    for entry in entries:
+        try:
+            rows.append(_pricing_row(entry))
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"pricing cache: skipped a malformed entry ({exc})", file=sys.stderr, flush=True)
+
+    cache.execute("DELETE FROM model_pricing")
+    cache.executemany(PRICING_UPSERT_SQL, rows)
+    cache.commit()
+    return len(rows)
+
+
 GRACE_SECONDS = 15 * 60
 
 
@@ -354,45 +570,83 @@ def _parse_ts(value: str) -> datetime | None:
     return parsed
 
 
-def resolve_workspace(container_id12: str, container_name: str, ts, windows):
-    """Match a call to its container's session: exact id first, name fallback.
+class SessionWindow(NamedTuple):
+    """One logs.db session row, as the resolver sees it."""
 
-    The id match needs no time logic, because Docker container ids are never
-    reused. The name fallback covers rows the proxy captured without an id and
-    rows whose id matches no session at all (logs.db pruned, or a session that
-    predates the id column); there the newest session that started before the
-    call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
-    after session end from the same container still inherits that container's
-    workspace. Returns (workspace, workspace_name, resolution_path) or None.
-    """
-    for id12, _name, workspace, workspace_name, _started_at in windows:
-        if id12 and id12 == container_id12:
-            return (workspace, workspace_name, "by_id")
-    best = None  # newest session started before the call
+    container_id12: str
+    container_name: str
+    workspace: str
+    workspace_name: str
+    profile: str
+    session_id: str
+    started_at: str
+
+
+def _newest_before(windows, ts):
+    """The candidate that started last on or before the call, or None."""
+    best = None
     best_started = None
-    for _id12, name, workspace, workspace_name, started_at in windows:
-        if name != container_name:
-            continue
-        started = _parse_ts(started_at)
+    for window in windows:
+        started = _parse_ts(window.started_at)
         if started is None:
             continue
         if ts is not None and started > ts:
             continue
         if best_started is None or started > best_started:
-            best, best_started = (workspace, workspace_name), started
-    if best is None:
+            best, best_started = window, started
+    return best
+
+
+def _earliest(windows):
+    """The candidate that started first; row order otherwise, which is
+    whatever the sessions query returned, is not a defined order."""
+    dated = [(started, w) for w in windows if (started := _parse_ts(w.started_at)) is not None]
+    if not dated:
+        return windows[0]
+    return min(dated, key=lambda pair: pair[0])[1]
+
+
+def resolve_session(container_id12: str, container_name: str, ts, windows):
+    """Match a call to its container's session: exact id first, name fallback.
+
+    Container ids are never reused, so an id match is always the right
+    container -- but not necessarily the right session, because a container can
+    host several (re-attaching opens another one). The call's own timestamp
+    picks between them, and if it predates every session of that container the
+    earliest one still claims it rather than dropping the call.
+
+    The name fallback covers rows the proxy captured without an id and rows
+    whose id matches no session at all (logs.db pruned, or a session that
+    predates the id column); there the newest session that started before the
+    call wins, covering `--name` reuse. ended_at is ignored on purpose: a call
+    after session end from the same container still inherits that container's
+    workspace, profile and session. Returns (SessionWindow, resolution_path)
+    or None.
+    """
+    by_id = [w for w in windows if w.container_id12 and w.container_id12 == container_id12]
+    if by_id:
+        return (_newest_before(by_id, ts) or _earliest(by_id), "by_id")
+    by_name = [w for w in windows if w.container_name == container_name]
+    match = _newest_before(by_name, ts)
+    if match is None:
         return None
-    return (best[0], best[1], "by_name")
+    return (match, "by_name")
 
 
-def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
+def sync_sessions(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRACE_SECONDS):
     """Refresh session_windows, then resolve every pending token_usage row.
 
+    A row is pending while its workspace, profile or session id is still empty.
     Rows that fail resolution AND were ingested longer ago than the grace
     period are decided 'unknown' once, so they do not get rescanned on every
     refresh. Recently ingested rows stay pending so a session row arriving in
     logs.db later still resolves them.
-    Returns resolution counts for the log line.
+
+    Workspace and session id are only ever known from the session. Profile is
+    normally recorded on the request by the proxy, and that value always wins
+    -- the session is the fallback for calls captured before the proxy logged
+    profiles, or by a proxy that does not.
+    Returns per-attribute counts for the log lines.
     """
     if not logs_path.exists() or not table_exists(cache, "session_windows"):
         return None
@@ -401,68 +655,114 @@ def sync_workspace(logs_path: Path, cache: sqlite3.Connection, grace_seconds=GRA
         if not table_exists(logs, "sessions"):
             return None
         rows = logs.execute(
-            "SELECT container_id, container_name, workspace, started_at FROM sessions",
+            "SELECT container_id, container_name, workspace, "
+            f"{profile_expr(logs, 'sessions', 'sessions')}, id, started_at FROM sessions",
         ).fetchall()
     finally:
         logs.close()
     windows = tuple(
-        (
-            (row[0] or "")[:12],
-            row[1] or "",
-            row[2] or "",
-            Path(row[2] or "").name or row[2] or "",
-            row[3] or "",
+        SessionWindow(
+            container_id12=(row[0] or "")[:12],
+            container_name=row[1] or "",
+            workspace=row[2] or "",
+            workspace_name=Path(row[2] or "").name or row[2] or "",
+            profile=row[3] or "",
+            session_id=row[4] or "",
+            started_at=row[5] or "",
         )
         for row in rows
     )
     cache.execute("DELETE FROM session_windows")
     cache.executemany(
         "INSERT INTO session_windows (container_id12, container_name, workspace, "
-        "workspace_name, started_at) VALUES (?, ?, ?, ?, ?)",
+        "workspace_name, profile, session_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         windows,
     )
     pending = cache.execute(
-        "SELECT source, row_id, container_id, container_name, timestamp, ingested_at "
-        "FROM token_usage WHERE workspace = ''",
+        "SELECT source, row_id, container_id, container_name, timestamp, ingested_at, "
+        "workspace, profile, session_id FROM token_usage "
+        "WHERE workspace = '' OR profile = '' OR session_id = ''",
     ).fetchall()
     deadline = datetime.now(UTC) - timedelta(seconds=grace_seconds)
-    updates = []
+    workspace_updates = []
+    profile_updates = []
+    session_updates = []
     counts = {"by_id": 0, "by_name": 0, "unknown": 0, "pending": 0}
-    for source, row_id, id12, name, ts, ingested_at in pending:
-        resolved = resolve_workspace(id12, name, _parse_ts(ts), windows)
-        workspace = None
-        if resolved is not None:
-            (workspace, workspace_name, path) = resolved
-            counts[path] += 1
-        else:
-            # An unparseable ingest stamp must still age out, otherwise the row
-            # is rescanned on every refresh forever.
-            ingested = _parse_ts(ingested_at)
-            if ingested is None or ingested <= deadline:
-                workspace = "unknown"
-                workspace_name = "unknown"
+    profile_counts = {"by_session": 0, "unknown": 0, "pending": 0}
+    session_counts = {"resolved": 0, "unknown": 0, "pending": 0}
+    for row in pending:
+        (source, row_id, id12, name, ts, ingested_at, workspace_now, profile_now, session_now) = row
+        resolved = resolve_session(id12, name, _parse_ts(ts), windows)
+        window, path = resolved if resolved is not None else (None, None)
+        # An unparseable ingest stamp must still age out, otherwise the row is
+        # rescanned on every refresh forever.
+        ingested = _parse_ts(ingested_at)
+        aged_out = ingested is None or ingested <= deadline
+        if workspace_now == "":
+            if window is not None:
+                counts[path] += 1
+                workspace_updates.append(
+                    (window.workspace, window.workspace_name, source, row_id),
+                )
+            elif aged_out:
                 counts["unknown"] += 1
+                workspace_updates.append(("unknown", "unknown", source, row_id))
             else:
                 counts["pending"] += 1
-        if workspace is not None:
-            updates.append((workspace, workspace_name, source, row_id))
-    if updates:
+        if profile_now == "":
+            # A session without a profile resolves nothing here: it ages out to
+            # 'unknown' like a call with no session at all.
+            session_profile = window.profile if window is not None else ""
+            if session_profile:
+                profile_counts["by_session"] += 1
+                profile_updates.append((session_profile, source, row_id))
+            elif aged_out:
+                profile_counts["unknown"] += 1
+                profile_updates.append(("unknown", source, row_id))
+            else:
+                profile_counts["pending"] += 1
+        if session_now == "":
+            # Same contract as the workspace: a call the proxy captured from a
+            # container with no session row is attributed to 'unknown' rather
+            # than dropped, so per-session totals still add up to the whole.
+            session_id = window.session_id if window is not None else ""
+            if session_id:
+                session_counts["resolved"] += 1
+                session_updates.append((session_id, source, row_id))
+            elif aged_out:
+                session_counts["unknown"] += 1
+                session_updates.append(("unknown", source, row_id))
+            else:
+                session_counts["pending"] += 1
+    if workspace_updates:
         cache.executemany(
             "UPDATE token_usage SET workspace = ?, workspace_name = ? "
             "WHERE source = ? AND row_id = ?",
-            updates,
+            workspace_updates,
+        )
+    if profile_updates:
+        cache.executemany(
+            "UPDATE token_usage SET profile = ? WHERE source = ? AND row_id = ?",
+            profile_updates,
+        )
+    if session_updates:
+        cache.executemany(
+            "UPDATE token_usage SET session_id = ? WHERE source = ? AND row_id = ?",
+            session_updates,
         )
     cache.commit()
-    return counts
+    return {"workspace": counts, "profile": profile_counts, "session": session_counts}
 
 
-def _log_workspace_counts(counts) -> None:
+def _log_resolution_counts(counts) -> None:
     if counts is None:
         return
-    print(
-        "workspace resolution: " + ", ".join(f"{k}={v}" for k, v in counts.items()),
-        flush=True,
-    )
+    for label in ("workspace", "profile", "session"):
+        bucket = counts[label]
+        print(
+            f"{label} resolution: " + ", ".join(f"{k}={v}" for k, v in bucket.items()),
+            flush=True,
+        )
 
 
 def build(
@@ -472,6 +772,7 @@ def build(
     batch_size=500,
     max_rows=0,
     full=False,
+    pricing_path: Path | None = None,
 ):
     cache = open_cache(usage_path)
     if full:
@@ -480,28 +781,40 @@ def build(
         cache.execute("DELETE FROM session_windows")
         cache.commit()
 
+    priced_rows = sync_pricing(cache, pricing_path or default_pricing_path())
+    print(f"pricing cache: {priced_rows} price rows loaded", flush=True)
+
     if not proxy_path.exists():
         if logs_path is not None:
-            _log_workspace_counts(sync_workspace(logs_path, cache))
+            _log_resolution_counts(sync_sessions(logs_path, cache))
         cache.close()
         return {"http": 0, "ws": 0}
 
     src = open_source(proxy_path)
     counts = {"http": 0, "ws": 0}
     try:
+        # Both queries read the profile off http_requests, so they share it.
+        profile = profile_expr(src, "http_requests", "r")
         if table_exists(src, "http_responses") and table_exists(src, "http_requests"):
             counts["http"] = sync_source(
                 "http",
-                HTTP_SQL,
+                HTTP_SQL.format(profile=profile),
                 src,
                 cache,
                 batch_size,
                 max_rows,
             )
         if table_exists(src, "websocket_messages"):
-            counts["ws"] = sync_source("ws", WS_SQL, src, cache, batch_size, max_rows)
+            counts["ws"] = sync_source(
+                "ws",
+                WS_SQL.format(profile=profile),
+                src,
+                cache,
+                batch_size,
+                max_rows,
+            )
         if logs_path is not None:
-            _log_workspace_counts(sync_workspace(logs_path, cache))
+            _log_resolution_counts(sync_sessions(logs_path, cache))
     finally:
         src.close()
         cache.close()
@@ -521,7 +834,12 @@ def main() -> int:
     parser.add_argument(
         "--logs-db",
         default=os.environ.get("LOGS_DB_PATH", "/data/logs.db"),
-        help="session log database used to resolve workspaces",
+        help="session log database used to resolve workspaces and profiles",
+    )
+    parser.add_argument(
+        "--pricing-file",
+        default=os.environ.get("PRICING_FILE_PATH", ""),
+        help="model pricing JSON; defaults to the bundled pricing/model_prices.json",
     )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument(
@@ -550,6 +868,7 @@ def main() -> int:
     proxy_path = Path(args.proxy_db)
     usage_path = Path(args.usage_db)
     logs_path = Path(args.logs_db)
+    pricing_path = Path(args.pricing_file) if args.pricing_file else default_pricing_path()
 
     while True:
         started = time.time()
@@ -561,6 +880,7 @@ def main() -> int:
                 batch_size=args.batch_size,
                 max_rows=args.max_rows,
                 full=args.full,
+                pricing_path=pricing_path,
             )
             print(
                 f"usage cache: +{counts['http']} http, +{counts['ws']} ws rows "
