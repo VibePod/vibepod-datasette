@@ -415,9 +415,12 @@ silently under-reporting. The rates actually applied to captured calls are query
 `/-/queries/usage/model_pricing_table`, each row carrying the `price_source` it came from.
 
 Because costs are stored rather than recomputed, each row also records the `genai-prices` release
-that priced it. Upgrading the package (rebuild the image, or `pip install -U genai-prices`) makes
-the next refresh re-price the rows that release did not produce, and log
-`pricing: repriced N rows`; a cache that is already current does no work. Prices are not fetched
+that priced it. The version is pinned in `requirements.txt`, so a new price list arrives as a
+reviewable change: Dependabot checks daily and opens a pull request when a new
+`genai-prices` release ships.
+Merging that bump and rebuilding the image makes the next refresh re-price the rows the new
+release prices differently, and log `pricing: repriced N rows`; a cache that is already
+current does no work. Prices are not fetched
 over the network — they ship with the installed package version, so the container stays offline.
 Without `genai-prices` installed, usage still ingests and totals normally and every call is simply
 left unpriced.
