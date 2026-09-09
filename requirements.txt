@@ -1,4 +1,4 @@
-brotli>=1.1,<2.0
+brotli>=1.2.0,<2.0
 datasette>=0.65,<2.0
 datasette-dashboards>=0.2
 genai-prices==0.1.6
