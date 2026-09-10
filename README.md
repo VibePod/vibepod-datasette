@@ -555,3 +555,17 @@ Open from Datasette under the `proxy` database query list, or directly via paths
 
 - `/-/queries/proxy/codex_ws_token_field_coverage`
 - `/-/queries/proxy/codex_ws_tokens_vs_http_by_request`
+
+## Publishing a release
+
+Cutting a GitHub Release publishes the container image to
+[Docker Hub](https://hub.docker.com/r/vibepod/datasette).
+
+1. Ensure `main` is in the state you want to ship.
+2. Create a GitHub Release tagged `v<semver>` (for example `v0.7.0`).
+3. The `publish-image` workflow builds the image after the test suite passes,
+   then pushes `vibepod/datasette:<version>` (leading `v` stripped) and
+   `vibepod/datasette:latest` as `linux/amd64` and `linux/arm64` manifests.
+4. Image pushes are the only thing a release publishes. A merged Dependabot
+   `genai-prices` bump is not a release: merge it, then cut a release when you
+   want the new price list shipped in an image.
